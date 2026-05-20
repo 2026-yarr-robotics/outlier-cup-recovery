@@ -70,24 +70,36 @@ SAFE_Z_MIN =  0.05   # link_6 flange 기준 최저 안전 z
 TOOL_LENGTH_M = 0.20     # link_6 flange → 그리퍼 손가락 closing 평면
                          # (RG2 + 툴체인저). click_pick_two의 Z_OFFSET와 동일 개념.
 CUP_R_AT_GRIP = 0.0225   # grip 지점 컵 반경. depth(컵 표면) → 컵 축 보정.
-                         # 위쪽 좁은 끝 지름 4.5cm → 반경 2.25cm.
+                         # grip이 narrow 끝에서 1.5cm 들어간 지점 → 반경 약 2.25cm
+                         # (narrow 지름 4.5~5.0cm 가정, 살짝 안쪽이라 거의 동일).
+                         # 컵 모양이 더 가파르게 좁아지면 이 값 키워야.
 
 # 동작 파라미터 (모두 flange_at_grip 기준 상대값)
 APPROACH_OFFSET = 0.10   # 컵 위 접근 높이 (m)
-GRIP_Z_MARGIN   = 0.005  # 그립 지점에서 위로 띄울 마진 (m)
+GRIP_Z_MARGIN   = 0.020  # 그립 지점에서 위로 띄울 마진 (m). 5mm → 20mm로 키워서
+                         # 그리퍼가 컵을 누르며 트립되는 것 방지.
 LIFT_Z          = 0.45   # 들어 올리는 최종 z (절대값, flange 기준)
 LIFT_HOLD_SEC   = 1.0    # 들어 올린 채 매달림 안정화 대기 시간 (s)
 
 # 컵 놓기 (drop / place 모드 공용)
-PLACE_X       = 0.40     # 컵을 세울 위치 (base frame, m)
-PLACE_Y       = 0.15     # 픽업 위치와 겹치지 않게
+PLACE_X       = 0.55     # 컵을 세울 위치 (base frame, m).
+                         # ⚠ place 모드에서 그리퍼가 수평으로 향하므로 flange는
+                         # PLACE에서 TOOL_LENGTH(0.20m) 만큼 -EE_Z 방향에 위치한다.
+                         # 컵 방향(cup_dir_base)에 따라 EE_Z가 ±X 어느 쪽이든 향할 수
+                         # 있으므로, PLACE_X가 너무 작으면 worst case에 flange가
+                         # robot 베이스에 너무 가까워져 IK 실패.
+                         # 안전 마진: PLACE_X >= 0.50 권장.
+PLACE_Y       = 0.0      # 픽업 위치와 겹치지 않게. 정면이 가장 reach 여유 큼.
 TABLE_Z       = 0.05     # 테이블 표면 z (base frame, m). 실측으로 조정.
 CUP_HEIGHT    = 0.10     # 컵 높이 (m). 실측으로 조정.
 DROP_HOLD_SEC = 3.0      # drop 모드에서 lift 후 release까지 대기 시간 (s)
 
 # place 모드 (방법 2: 손목 pitch 90° 회전으로 세우기) 전용
 STAND_PITCH_SIGN_OVERRIDE = None  # None=자동, +1/-1로 강제 (cup 거꾸로 서면 부호 바꿈)
-STAND_CUP_MARGIN_M        = 0.01  # standing 시 컵 바닥과 테이블 사이 여유 (m)
+STAND_CUP_MARGIN_M        = -0.02 # standing 시 컵 바닥과 테이블 사이 여유 (m).
+                                  # 음수면 closing_z를 더 낮춰서 release. 컵이 튕기지
+                                  # 않도록 바닥 가까이에서 놓고 싶을 때 음수 사용.
+                                  # 단, TABLE_Z가 정확해야 안전. 너무 음수면 충돌.
 
 # 그리퍼 (raw 단위: 1/10 mm)
 GRIPPER_NAME     = "rg2"
@@ -105,11 +117,10 @@ GRIP_FORCE       = 200   # 약 13 N (얇은 컵이므로 약하게)
 # 그리퍼 부호 보정 (실험으로 결정)
 # 그리퍼 두 손가락이 컵 긴축에 "수직"이 되도록 회전.
 # 만약 dry-run에서 손가락이 컵 축과 평행이 되면 부호 뒤집어야 함.
-YAW_OFFSET_DEG = 0.0    # RG2 마운팅에 따라 결정:
-                        #   - RG2가 EE의 X축을 따라 닫히는 마운팅 → ±90
-                        #   - RG2가 EE의 Y축을 따라 닫히는 마운팅 → 0 or 180
-                        # wrap이 [-π/2, π/2]로 정규화하므로 0과 180은 등가.
-                        # 손가락 평면이 컵 축에 평행이면 ±90 ↔ 0/180 으로 바꿔서 재시도.
+YAW_OFFSET_DEG = 90.0   # joint_6=0° HOME 기준에서 RG2가 EE_X 따라 닫히는 결과가 되어
+                        # 컵 축과 평행해지므로 +90 으로 90° 회전시켜 수직 grip 만든다.
+                        # (이전 joint_6=90° HOME 에서는 0 이었음.)
+                        # 손가락이 컵 축에 또 평행이면 -90 으로 부호 반대로.
 
 # 인식 안정화
 SAMPLE_COLLECT_SEC = 8.0   # grasp_pose 수집 대기 시간 (최대)
@@ -122,9 +133,9 @@ DOWN_ORI = {"x": 0.0, "y": 1.0, "z": 0.0, "w": 0.0}  # EE -Z 방향
 #   code p - real p = (BASE_OFFSET_X, BASE_OFFSET_Y, BASE_OFFSET_Z)
 # 코드에서 p_base[i] -= BASE_OFFSET_i 로 빼준다.
 # 카메라 마운팅이 바뀌거나 calibration 재실행 시 다시 0으로 두고 측정.
-BASE_OFFSET_X = 0.0   # ⚠ 상수 offset은 한 점에서만 맞고 다른 위치에선 빗나감.
-BASE_OFFSET_Y = 0.0   #   잔여 오차의 원인이 calibration 회전이면 이 값들은 모두 0으로
-BASE_OFFSET_Z = 0.0   #   유지하고 hand-eye 재캘리브로 해결할 것.
+BASE_OFFSET_X = 0.0   # joint_6=0° HOME 기준으로 재측정 후 결정 예정
+BASE_OFFSET_Y = 0.0   # joint_6=0° HOME 기준으로 재측정 후 결정 예정
+BASE_OFFSET_Z = 0.080 # Z 오차는 joint_6 무관하게 +8cm 일정 (그리퍼 z 보정)
 
 
 # ─────────────────────────────────────────────────────────
@@ -272,6 +283,11 @@ class StandFallenCupNode(Node):
         self.declare_parameter("dry_run", False)
         self.declare_parameter("cup_yaw_override_deg", float("nan"))
         self.declare_parameter("mode", "drop")
+        # use_current_as_home: true면 launch 시점의 robot 상태를 세션 HOME으로 저장.
+        #   티치펜던트에서 설정한 HOME 위치를 코드 수정 없이 그대로 사용 가능.
+        #   초기 HOME 이동을 스킵하고 종료 시 그 자세로 정확히 복귀.
+        # false면 코드에 박힌 HOME_JOINTS 사용 (기존 동작).
+        self.declare_parameter("use_current_as_home", True)
         # sim: 카메라/그리퍼 하드웨어 없이 MoveIt virtual에서 동작 시각화
         self.declare_parameter("sim", False)
         self.declare_parameter("sim_cup_x", 0.40)
@@ -280,6 +296,9 @@ class StandFallenCupNode(Node):
         self.declare_parameter("sim_cup_yaw_deg", 0.0)
 
         self.dry_run = bool(self.get_parameter("dry_run").value)
+        self.use_current_as_home = bool(
+            self.get_parameter("use_current_as_home").value
+        )
         self.cup_yaw_override_deg = float(
             self.get_parameter("cup_yaw_override_deg").value
         )
@@ -501,11 +520,11 @@ class StandFallenCupNode(Node):
         T_base_cam = T_base_ee @ T_ee_cam
 
         p_base = (T_base_cam @ np.append(p_cam, 1.0))[:3]
-        # Y-axis 부호 반전 (Doosan get_current_posx 좌표계와 ROS/MoveIt 좌표계의
-        # Y축 규칙 차이를 보정. 위치·방향벡터 둘 다 동일하게 적용해야 함).
-        p_base[1] = -p_base[1]
+        # Y-flip은 wrist joint(joint_6) 위치에 따라 달라지는 보정이라 비활성화.
+        # 새 calibration이 link_6 기준으로 잘 풀려있다면 raw transform만으로 충분.
+        # p_base[1] = -p_base[1]
 
-        # 잔여 오차 상수 보정 (재캘리브 후엔 보통 0).
+        # 잔여 오차 상수 보정 (재측정으로 결정).
         p_base[0] -= BASE_OFFSET_X
         p_base[1] -= BASE_OFFSET_Y
         p_base[2] -= BASE_OFFSET_Z
@@ -536,8 +555,8 @@ class StandFallenCupNode(Node):
 
         v_cam  = np.array([math.cos(cam_yaw), math.sin(cam_yaw), 0.0])
         v_base = T_base_cam[:3, :3] @ v_cam
-        # 위치와 동일한 Y-flip을 방향벡터에도 적용 (일관성).
-        v_base[1] = -v_base[1]
+        # 위치와 동일하게 Y-flip 비활성 (joint_6 의존성 회피).
+        # v_base[1] = -v_base[1]
         cup_yaw_base = math.atan2(v_base[1], v_base[0])
 
         log.info(
@@ -593,6 +612,14 @@ class StandFallenCupNode(Node):
                 f"[sim] gripper.move_gripper({width}, {force}) skipped"
             )
 
+    # ── 현재 joint 상태 읽기 ──────────────
+    def _read_current_joints(self):
+        """planning_scene_monitor에서 현재 joint positions를 읽어 dict로 반환."""
+        psm = self.robot.get_planning_scene_monitor()
+        with psm.read_only() as scene:
+            joints = dict(scene.current_state.joint_positions)
+        return joints
+
     # ── IK 잠금 헬퍼 ──────────────────────
     def ik_state_with_current_seed(self, pose_stamped, timeout=1.0):
         """
@@ -633,16 +660,36 @@ class StandFallenCupNode(Node):
         log.info("[Init] controller 연결 대기 3s")
         time.sleep(3.0)
 
-        # 1) HOME
-        log.info("[Init] HOME 이동")
-        home_state = RobotState(self.robot_model)
-        home_state.joint_positions = HOME_JOINTS
-        home_state.update()
-        if not plan_and_execute(self.robot, self.arm, log,
-                                state_goal=home_state,
-                                params=self.ompl_params):
-            log.error("HOME 이동 실패 — 종료")
-            return
+        # 1) HOME 결정 + (필요 시) 이동
+        if self.use_current_as_home:
+            # 티치펜던트에서 설정한 현재 자세를 그대로 세션 HOME으로 채택.
+            # 초기 HOME 이동 없이 현재 joint state를 저장만 한다.
+            self._session_home_joints = self._read_current_joints()
+            log.info(
+                "[Init] use_current_as_home=true → 현재 자세를 세션 HOME으로 캡처 "
+                "(초기 HOME 이동 스킵)"
+            )
+            for jn, jv in self._session_home_joints.items():
+                log.info(f"  {jn} = {math.degrees(jv):+.2f}°")
+        else:
+            log.info("[Init] HOME 이동 (코드 HOME_JOINTS 사용)")
+            home_state = RobotState(self.robot_model)
+            home_state.joint_positions = HOME_JOINTS
+            home_state.update()
+            if not plan_and_execute(self.robot, self.arm, log,
+                                    state_goal=home_state,
+                                    params=self.ompl_params):
+                log.error("HOME 이동 실패 — 종료")
+                return
+            self._session_home_joints = dict(HOME_JOINTS)
+
+        # 시작 시점의 link_6 pose를 저장 (종료 시 동일한 자세로 복귀했는지 검증용)
+        self._start_T_base_ee = get_ee_matrix(self.robot)
+        sp = self._start_T_base_ee[:3, 3]
+        log.info(
+            f"[Init] HOME link_6 pose: "
+            f"pos=({sp[0]:.3f},{sp[1]:.3f},{sp[2]:.3f})"
+        )
 
         # 2) 그리퍼 열기
         self._gripper_move(GRIP_OPEN_WIDTH, GRIP_FORCE)
@@ -813,9 +860,12 @@ class StandFallenCupNode(Node):
             log.info("=== drop 완료 ===")
 
         elif self.mode == "place":
-            # === 방법 2: 손목 pitch 90° 회전으로 컵 세우기 ===
+            # === 컵을 수직(wide 끝이 바닥)으로 세우기 ===
+            # YAW_OFFSET_DEG 값에 무관하도록 cross-product 기반 axis-angle 회전 사용.
+            # cup_dir_base (lift 시 컵 narrow→wide 방향) 를 base의 -Z 방향에 맞추는
+            # 최소 회전 R_align 을 구하고, R_stand = R_align @ R_lift_mat.
 
-            # (a) 현재 lift 자세의 회전행렬 R_lift = R_yaw(grip_yaw_wrapped) @ R_DOWN
+            # (a) lift 자세의 회전행렬 R_lift = R_yaw(grip_yaw_wrapped) @ R_DOWN
             grip_yaw_w = cup_yaw + math.radians(YAW_OFFSET_DEG)
             _w = math.atan2(math.sin(grip_yaw_w), math.cos(grip_yaw_w))
             if _w > math.pi / 2:
@@ -832,32 +882,67 @@ class StandFallenCupNode(Node):
                 [0.0,  0.0, 1.0],
             ])
             R_lift_mat = R_yaw_mat @ R_DOWN
-            EE_X_lift  = R_lift_mat[:, 0]
 
-            # (b) pitch 부호 자동 결정
-            #     cup wide 방향이 +EE_X 쪽이면 pitch -90° → +EE_X가 DOWN
-            #     cup wide 방향이 -EE_X 쪽이면 pitch +90° → -EE_X가 DOWN
-            if STAND_PITCH_SIGN_OVERRIDE is not None:
-                pitch_sign = int(STAND_PITCH_SIGN_OVERRIDE)
-                log.info(f"[place] pitch_sign={pitch_sign:+d} (override)")
+            # (b) cup_dir_base → -base_Z (wide 끝이 바닥 향함) 로 매핑하는 최소 회전
+            final_cup_dir = np.array([0.0, 0.0, -1.0])
+            v_cross = np.cross(cup_dir_base, final_cup_dir)
+            v_dot = float(np.dot(cup_dir_base, final_cup_dir))
+            cross_norm = float(np.linalg.norm(v_cross))
+
+            if cross_norm < 1e-6:
+                if v_dot > 0.0:
+                    R_align = np.eye(3)
+                    align_angle_deg = 0.0
+                else:
+                    # 컵이 이미 위로 향함 (드문 케이스). base X축 기준 180° flip.
+                    R_align = np.diag([1.0, -1.0, -1.0])
+                    align_angle_deg = 180.0
             else:
-                dot = float(np.dot(EE_X_lift[:2], cup_dir_base[:2]))
-                pitch_sign = -1 if dot > 0 else +1
-                log.info(
-                    f"[place] cup_dir·EE_X = {dot:+.2f} → pitch_sign={pitch_sign:+d}"
-                )
+                axis = v_cross / cross_norm
+                angle = math.atan2(cross_norm, v_dot)
+                align_angle_deg = math.degrees(angle)
+                K = np.array([
+                    [0.0, -axis[2], axis[1]],
+                    [axis[2], 0.0, -axis[0]],
+                    [-axis[1], axis[0], 0.0],
+                ])
+                R_align = (np.eye(3)
+                           + math.sin(angle) * K
+                           + (1.0 - math.cos(angle)) * (K @ K))
 
-            # (c) standing orientation
-            pa = pitch_sign * math.pi / 2
-            cp, sp = math.cos(pa), math.sin(pa)
-            Ry_local = np.array([
-                [cp,  0.0, sp],
-                [0.0, 1.0, 0.0],
-                [-sp, 0.0, cp],
-            ])
-            R_stand = R_lift_mat @ Ry_local
+            R_pre_twist = R_align @ R_lift_mat
+
+            # (b.5) IK reach 안정성: gripper EE_Z를 ±base_Y 방향(옆 접근)으로 강제.
+            #       컵은 base -Z 방향(수직)이므로 base_Z 축 회전을 더해도 컵 자세 유지.
+            #       gripper가 정면(+X)이 아닌 측면(±Y)에서 접근하면 wrist가
+            #       singular 영역을 피할 수 있어 IK가 더 잘 풀린다.
+            EE_Z_after = R_pre_twist[:, 2]
+            ez_xy_norm = float(np.linalg.norm(EE_Z_after[:2]))
+            if ez_xy_norm > 1e-6:
+                cur_angle = math.atan2(EE_Z_after[1], EE_Z_after[0])
+                # 가장 가까운 ±Y 방향 선택
+                target_angle = math.pi / 2 if EE_Z_after[1] >= 0 else -math.pi / 2
+                twist = target_angle - cur_angle
+                twist = math.atan2(math.sin(twist), math.cos(twist))
+                cz, sz = math.cos(twist), math.sin(twist)
+                R_twist = np.array([
+                    [cz, -sz, 0.0],
+                    [sz,  cz, 0.0],
+                    [0.0, 0.0, 1.0],
+                ])
+                R_stand = R_twist @ R_pre_twist
+                twist_deg = math.degrees(twist)
+            else:
+                R_stand = R_pre_twist
+                twist_deg = 0.0
+
             sqx, sqy, sqz, sqw = rotmat_to_quat_xyzw(R_stand)
             stand_ori = {"x": sqx, "y": sqy, "z": sqz, "w": sqw}
+            log.info(
+                f"[place] cup_dir_base=({cup_dir_base[0]:+.2f},"
+                f"{cup_dir_base[1]:+.2f},{cup_dir_base[2]:+.2f}) → "
+                f"align={align_angle_deg:.1f}° + Z-twist={twist_deg:+.1f}°"
+            )
 
             # (d) standing flange 위치
             # closing plane을 (PLACE_X, PLACE_Y, TABLE_Z+CUP_HEIGHT+margin) 로
@@ -914,14 +999,50 @@ class StandFallenCupNode(Node):
                                  params=self.pilz_params)
             log.info("=== place (방법2: pitch tilt) 완료 ===")
 
-        # 9) HOME 복귀 (안전)
-        log.info("[Final] HOME 복귀")
+        # 9) HOME 복귀 — 시작과 동일한 자세로 강제 복귀 (재시도 + 검증)
+        log.info("[Final] HOME 복귀 (시작 자세로)")
         home_back = RobotState(self.robot_model)
-        home_back.joint_positions = HOME_JOINTS
+        home_back.joint_positions = self._session_home_joints
         home_back.update()
-        plan_and_execute(self.robot, self.arm, log,
-                         state_goal=home_back,
-                         params=self.ompl_params)
+
+        # 1차: OMPL (충돌 회피 강함, 자유로운 경로)
+        home_ok = plan_and_execute(self.robot, self.arm, log,
+                                   state_goal=home_back,
+                                   params=self.ompl_params)
+
+        # 2차 fallback: Pilz PTP (joint-space 직선, OMPL 실패해도 reachable이면 풀림)
+        if not home_ok:
+            log.warn("[Final] OMPL HOME 복귀 실패 — Pilz PTP로 재시도")
+            home_ok = plan_and_execute(self.robot, self.arm, log,
+                                       state_goal=home_back,
+                                       params=self.pilz_params)
+
+        # 그리퍼도 시작과 동일하게 — 열림 상태
+        self._gripper_move(GRIP_OPEN_WIDTH, GRIP_FORCE)
+        time.sleep(0.5)
+
+        # 종료 자세와 시작 자세 비교 (link_6 pose 차이 확인)
+        if hasattr(self, "_start_T_base_ee"):
+            end_T_base_ee = get_ee_matrix(self.robot)
+            dp = end_T_base_ee[:3, 3] - self._start_T_base_ee[:3, 3]
+            dp_norm = float(np.linalg.norm(dp))
+            # 회전 차이도 측정 (Frobenius norm)
+            dR = end_T_base_ee[:3, :3] - self._start_T_base_ee[:3, :3]
+            dR_norm = float(np.linalg.norm(dR))
+            ep = end_T_base_ee[:3, 3]
+            log.info(
+                f"[Final] 종료 link_6 pos=({ep[0]:.3f},{ep[1]:.3f},{ep[2]:.3f}) "
+                f"| Δpos={dp_norm*1000:.1f}mm, Δrot={dR_norm:.3f}"
+            )
+            if dp_norm < 0.005 and dR_norm < 0.01:
+                log.info("[Final] ✓ 시작 자세와 종료 자세 일치")
+            else:
+                log.warn(
+                    "[Final] ⚠ 시작/종료 자세 차이 큼 — HOME 복귀가 완전히 안 됐을 수 있음"
+                )
+
+        if not home_ok:
+            log.error("[Final] HOME 복귀 모든 시도 실패 — 로봇 자세 수동 확인 필요")
 
 
 def main(args=None):
