@@ -14,8 +14,62 @@ from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import PoseStamped
 
-from cv_bridge import CvBridge
 from ultralytics import YOLO
+
+
+# cv_bridge 대체 (numpy 1.x↔2.x ABI 충돌 회피).
+# cv_bridge의 C extension은 numpy 1.x 기준으로 컴파일돼 있어서 numpy 2.x 환경에서
+# `_ARRAY_API not found` 에러로 죽음. 직접 numpy로 변환하면 의존성 제거.
+def imgmsg_to_cv2(msg, desired_encoding="passthrough"):
+    """sensor_msgs/Image → cv2/numpy. desired_encoding은 bgr8 또는 passthrough."""
+    h, w = msg.height, msg.width
+    enc = msg.encoding
+
+    if enc == "16UC1":
+        arr = np.frombuffer(msg.data, dtype=np.uint16).reshape(h, w)
+    elif enc == "32FC1":
+        arr = np.frombuffer(msg.data, dtype=np.float32).reshape(h, w)
+    elif enc == "mono8":
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w)
+    elif enc in ("bgr8", "rgb8"):
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3)
+    elif enc in ("bgra8", "rgba8"):
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 4)
+    else:
+        raise ValueError(f"Unsupported encoding: {enc}")
+
+    if desired_encoding == "passthrough" or desired_encoding == enc:
+        return arr.copy()
+
+    if desired_encoding == "bgr8":
+        if enc == "rgb8":
+            return arr[:, :, ::-1].copy()
+        if enc == "bgra8":
+            return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+        if enc == "rgba8":
+            return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+        if enc == "mono8":
+            return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+
+    raise ValueError(f"Cannot convert {enc} → {desired_encoding}")
+
+
+def cv2_to_imgmsg(image, encoding="bgr8"):
+    """cv2/numpy → sensor_msgs/Image. bgr8/rgb8/mono8 지원."""
+    msg = Image()
+    h, w = image.shape[:2]
+    msg.height = h
+    msg.width = w
+    msg.encoding = encoding
+    msg.is_bigendian = 0
+    if encoding in ("bgr8", "rgb8"):
+        msg.step = w * 3
+    elif encoding == "mono8":
+        msg.step = w
+    else:
+        raise ValueError(f"Unsupported encoding: {encoding}")
+    msg.data = image.tobytes()
+    return msg
 
 
 def as_bool(value):
@@ -85,9 +139,12 @@ class FallenCupPoseNode(Node):
 
         self.declare_parameter("use_depth", False)
 
-        # top_center에서 bottom 방향으로 얼마나 안쪽을 잡을지
-        # 0.025 m = 2.5 cm
-        self.declare_parameter("grip_offset_m", 0.025)
+        # top_center에서 bottom 방향으로 얼마나 안쪽을 잡을지.
+        # speed-stack recovery 용으로 컵의 narrow 끝 부근을 잡아 들어 올린 뒤
+        # 회전시켜 wide 면을 바닥으로 향하게 세움. 가까운 끝(narrow)을 잡아야
+        # 회전 시 그리퍼/로봇이 바닥에 안 부딪히고 안정적으로 매달림.
+        # 기본 0.015 m = 1.5 cm. 컵이 더 길거나 narrow 끝 직경이 크면 키워야.
+        self.declare_parameter("grip_offset_m", 0.015)
 
         # depth를 안 쓸 때 pixel offset 계산용.
         # 실제 컵의 작은 원 지름을 재서 넣는 것을 추천.
@@ -139,7 +196,7 @@ class FallenCupPoseNode(Node):
         if self.device == "cpu":
             self.half = False
 
-        self.bridge = CvBridge()
+        # cv_bridge 제거 — 모듈 단위 helper(imgmsg_to_cv2, cv2_to_imgmsg) 사용
 
         self.last_depth_m = None
         self.last_depth_header = None
@@ -201,7 +258,7 @@ class FallenCupPoseNode(Node):
     # -----------------------------
     def depth_callback(self, msg: Image):
         try:
-            depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            depth = imgmsg_to_cv2(msg, desired_encoding="passthrough")
         except Exception as e:
             self.get_logger().warn(f"depth conversion failed: {e}")
             return
@@ -592,7 +649,7 @@ class FallenCupPoseNode(Node):
     # -----------------------------
     def image_callback(self, msg: Image):
         try:
-            frame_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            frame_bgr = imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
             self.get_logger().error(f"image conversion failed: {e}")
             return
@@ -727,7 +784,7 @@ class FallenCupPoseNode(Node):
 
     def publish_debug(self, image_bgr, header):
         try:
-            msg = self.bridge.cv2_to_imgmsg(image_bgr, encoding="bgr8")
+            msg = cv2_to_imgmsg(image_bgr, encoding="bgr8")
             msg.header = header
             self.debug_pub.publish(msg)
         except Exception as e:
