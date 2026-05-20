@@ -77,6 +77,12 @@ class FallenCupPoseNode(Node):
         # two_face: 작은 원/큰 원 두 mask로 방향 추정
         self.declare_parameter("mode", "auto")
 
+        # 방향벡터를 추출할 대상 클래스 이름.
+        # YOLO 모델이 fallen-cup / upright-cup 두 클래스를 학습한 경우,
+        # 넘어진 컵에 대해서만 yaw를 뽑아야 그리퍼가 올바르게 잡을 수 있다.
+        # 빈 문자열("")로 두면 클래스 필터링을 끈다(이전 동작과 호환).
+        self.declare_parameter("target_class_name", "fallen-cup")
+
         self.declare_parameter("use_depth", False)
 
         # top_center에서 bottom 방향으로 얼마나 안쪽을 잡을지
@@ -111,6 +117,7 @@ class FallenCupPoseNode(Node):
         self.half = as_bool(self.get_parameter("half").value)
 
         self.mode = str(self.get_parameter("mode").value)
+        self.target_class_name = str(self.get_parameter("target_class_name").value)
         self.use_depth = as_bool(self.get_parameter("use_depth").value)
 
         self.grip_offset_m = float(self.get_parameter("grip_offset_m").value)
@@ -186,6 +193,8 @@ class FallenCupPoseNode(Node):
         self.get_logger().info(f"image_topic: {self.image_topic}")
         self.get_logger().info(f"mode: {self.mode}")
         self.get_logger().info(f"use_depth: {self.use_depth}")
+        self.get_logger().info(f"target_class_name: '{self.target_class_name}'")
+        self.get_logger().info(f"model classes: {getattr(self.model, 'names', None)}")
 
     # -----------------------------
     # Depth / camera info
@@ -297,6 +306,7 @@ class FallenCupPoseNode(Node):
 
             conf = float(confs[i]) if confs is not None and i < len(confs) else 1.0
             cls_id = int(clss[i]) if clss is not None and i < len(clss) else -1
+            cls_name = self._class_id_to_name(cls_id)
 
             detections.append({
                 "mask": binary,
@@ -306,9 +316,36 @@ class FallenCupPoseNode(Node):
                 "diameter": float(equivalent_diameter),
                 "conf": conf,
                 "cls_id": cls_id,
+                "cls_name": cls_name,
             })
 
         return detections
+
+    def _class_id_to_name(self, cls_id):
+        if cls_id is None or cls_id < 0:
+            return None
+        names = getattr(self.model, "names", None)
+        if names is None:
+            return None
+        if isinstance(names, dict):
+            return names.get(cls_id)
+        try:
+            return names[cls_id]
+        except (IndexError, KeyError, TypeError):
+            return None
+
+    def filter_target_detections(self, detections):
+        """target_class_name과 일치하는 detection만 남긴다.
+
+        target_class_name이 빈 문자열이면 필터링하지 않고 모두 통과시킨다(이전 동작).
+        모델 클래스 이름을 얻지 못한 detection은 안전하게 제외한다.
+        """
+        if not self.target_class_name:
+            return list(detections)
+        return [
+            d for d in detections
+            if d.get("cls_name") == self.target_class_name
+        ]
 
     # -----------------------------
     # Method 1: two face masks
@@ -588,13 +625,26 @@ class FallenCupPoseNode(Node):
             self.publish_debug(debug, msg.header)
             return
 
+        # 방향벡터는 target 클래스(fallen-cup)에서만 추출한다.
+        # upright-cup mask가 섞여서 잘못된 top/bottom face 페어가 만들어지는 것을 막는다.
+        target_detections = self.filter_target_detections(detections)
+
+        if len(target_detections) == 0:
+            self.get_logger().info(
+                f"target class '{self.target_class_name}'에 해당하는 detection 없음 "
+                f"(전체 {len(detections)}개) — yaw 추출 스킵"
+            )
+            self.draw_debug_detections_only(debug, detections)
+            self.publish_debug(debug, msg.header)
+            return
+
         estimate = None
 
         if self.mode in ["auto", "two_face"]:
-            estimate = self.estimate_from_two_faces(detections)
+            estimate = self.estimate_from_two_faces(target_detections)
 
         if estimate is None and self.mode in ["auto", "silhouette"]:
-            largest = max(detections, key=lambda x: x["area"])
+            largest = max(target_detections, key=lambda x: x["area"])
             estimate = self.estimate_from_silhouette(largest)
 
         if estimate is None:
@@ -686,6 +736,16 @@ class FallenCupPoseNode(Node):
     # -----------------------------
     # Debug drawing
     # -----------------------------
+    def draw_debug_detections_only(self, image, detections):
+        """추정이 없을 때 mask 윤곽만 표시 (target/non-target 색 구분)."""
+        for det in detections:
+            is_target = (
+                not self.target_class_name
+                or det.get("cls_name") == self.target_class_name
+            )
+            color = (0, 255, 255) if is_target else (80, 80, 80)
+            cv2.drawContours(image, [det["contour"]], -1, color, 1)
+
     def draw_debug(self, image, detections, estimate):
         for det in detections:
             cv2.drawContours(image, [det["contour"]], -1, (80, 80, 80), 1)

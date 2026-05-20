@@ -56,6 +56,15 @@ def generate_launch_description():
             description="auto, silhouette, or two_face",
         ),
         DeclareLaunchArgument(
+            "target_class_name",
+            default_value="fallen-cup",
+            description=(
+                "방향벡터를 뽑을 YOLO 클래스 이름. "
+                "이 클래스의 mask만 사용하고 나머지(upright-cup 등)는 무시한다. "
+                "빈 문자열이면 필터링 끔."
+            ),
+        ),
+        DeclareLaunchArgument(
             "use_depth",
             default_value="false",
         ),
@@ -92,6 +101,7 @@ def generate_launch_description():
                 "half": LaunchConfiguration("half"),
 
                 "mode": LaunchConfiguration("mode"),
+                "target_class_name": LaunchConfiguration("target_class_name"),
                 "use_depth": LaunchConfiguration("use_depth"),
 
                 "grip_offset_m": LaunchConfiguration("grip_offset_m"),
