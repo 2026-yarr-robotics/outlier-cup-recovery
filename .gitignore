@@ -34,3 +34,6 @@ log/
 
 # System files
 .DS_Store
+
+# Claude dev logs (작업 내역 메모, 리포에 push 안 함)
+.claude_logs/
