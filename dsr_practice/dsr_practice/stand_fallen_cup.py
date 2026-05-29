@@ -32,7 +32,7 @@ from rclpy.node import Node
 
 from ament_index_python.packages import get_package_share_directory
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseArray
 from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -100,6 +100,19 @@ STAND_CUP_MARGIN_M        = -0.05 # standing 시 컵 바닥과 테이블 사이 
                                   # 음수면 closing_z를 더 낮춰서 release. 컵이 튕기지
                                   # 않도록 바닥 가까이에서 놓고 싶을 때 음수 사용.
                                   # 단, TABLE_Z가 정확해야 안전. 너무 음수면 충돌.
+
+# place 모드 standing pose의 base_Z twist 임계값.
+# - twist 분리 실행(pre-twist) 트리거 (lift 위치에서 base_Z 회전을 먼저 분리)
+# - "문제 케이스(컵이 강제 방향과 반대로 누움)" 자동 감지 기준
+# 같은 값 사용해야 두 경로의 의미가 일관됨.
+PRE_TWIST_THRESHOLD_DEG = 90.0
+
+# place_plus_y_auto_swing 의 cup 방향 감지 임계값.
+# sin(cup_yaw_base) > 이 값 → cup wide 가 +Y 영역으로 누움 → swing strategy 트리거.
+#   0.50 = cup_yaw ∈ [+30°, +150°] (넉넉)
+#   0.87 = cup_yaw ∈ [+60°, +120°] (엄격, 거의 ±Y 만)
+# 기본 0.50: 살짝 sideways 도 +Y로 간주.
+PLUS_Y_DETECT_SIN_THRESHOLD = 0.50
 
 # 그리퍼 (raw 단위: 1/10 mm)
 GRIPPER_NAME     = "rg2"
@@ -295,6 +308,74 @@ class StandFallenCupNode(Node):
         # 컵 wide 끝이 강제 방향과 반대면 gripper가 cup axis 주변으로 180° 추가 회전됨
         # (cup은 회전축이므로 cup axis = vertical 유지, wide 끝 down 유지).
         self.declare_parameter("place_flange_side", "right")
+        # place_flange_yaw_deg:
+        #   NaN(기본) 이면 place_flange_side에 따른 ±90° 사용 (기존 동작).
+        #   값이 있으면 standing 시 base_Z 기준 EE_Z 방향(deg)을 그 값으로 강제.
+        #   예: +135 → EE_Z=(-√2/2, +√2/2, 0). flange가 +X 쪽으로 빠지면서 elbow 들림.
+        # 컵이 안전하게 vertical로 서는 건 base_Z 축 twist이면 어떤 각도든 동일하지만,
+        # +Y obstacle 회피 측면에서는 반드시 [+90°, +180°] (혹은 [-180°, -90°]) 범위 권장.
+        # 그 외 범위는 forearm이 +Y로 다시 들어갈 수 있음 — 신중하게 사용.
+        self.declare_parameter("place_flange_yaw_deg", float("nan"))
+        # place_flange_yaw_auto_extra_deg:
+        #   NaN(기본) 이면 자동 확장 비활성.
+        #   값이 있고, provisional twist(=baseline target_angle 기준)가
+        #   PRE_TWIST_THRESHOLD_DEG 를 넘는 "문제 케이스"가 감지되면
+        #   target_angle 을 baseline + sign(baseline) * extra 로 자동 확장.
+        #   예: side=right(baseline=+90°), extra=45 → target_angle=+135°.
+        # cup wide가 강제 방향(side)과 반대로 누운 경우에만 발동 → 정상 케이스 영향 X.
+        self.declare_parameter("place_flange_yaw_auto_extra_deg", float("nan"))
+        # stand_cup_margin_m:
+        #   standing 시 컵 바닥과 테이블 사이 여유 (m). closing_z 보정.
+        #   기본값 = 모듈 상수 STAND_CUP_MARGIN_M(=-0.05) → 컵을 바닥 가까이 release.
+        #   양수로 키우면 closing_z 가 그만큼 올라가 flange Z 가 같이 올라감 →
+        #   팔 전체가 위로 올라가 elbow 가 테이블에서 멀어짐. 컵은 그 높이에서 drop.
+        #   너무 크면 컵이 튕기므로 +0.05~+0.10 부터 시도 권장.
+        self.declare_parameter("stand_cup_margin_m", STAND_CUP_MARGIN_M)
+        # place_base_yaw_deg:
+        #   NaN(기본) 이면 미사용. 값이 있으면 standing(+retreat) IK 시 joint_1을
+        #   이 값(deg)으로 seed override → IK solver가 joint_1≈target branch로 수렴
+        #   → 로봇 전체가 base 기준 yaw로 회전된 자세로 standing 수행.
+        #   목적: upper arm + elbow를 workspace 밖으로 swing 시켜 elbow ↔ table 충돌 회피.
+        #   주의:
+        #     - 너무 큰 각(±90°+) 은 IK 실패 또는 다른 branch로 수렴할 수 있음.
+        #     - +방향이면 elbow가 +Y 쪽, -방향이면 -Y 쪽. +Y obstacle 상황이면 음수 권장.
+        #     - KDL IK는 seed 근사 수렴이라 항상 desired branch로 가지 않을 수 있음.
+        #       로그의 final joint_1 값으로 적용 여부 확인.
+        self.declare_parameter("place_base_yaw_deg", float("nan"))
+        # place_cup_tilt_deg:
+        #   standing 시 cup을 vertical 에서 -EE_Z 방향(그리퍼 반대 쪽)으로 α° 기울임.
+        #   기본 0 = 수직. 값 있으면:
+        #     - flange Z 가 sin α × TOOL_LENGTH_M ≈ α=20° 일 때 +68mm 상승
+        #     - closing_z 는 cos α 보정으로 약간 하강 (CUP_HEIGHT × (1-cos α) ≈ 6mm)
+        #     - 순효과: flange Z 약 +62mm (α=20°), trajectory 전체가 위로 들림 → elbow 회피.
+        #   원리: cup 은 release 후 wide bottom self-righting (tip-over 한계 ≈ atan(R/h)≈37°).
+        #         10~20° 는 안전 영역.
+        #   주의: α 가 클수록 cup 이 더 기울어진 채로 release → 떨어지면서 한쪽 edge 가 먼저 접지.
+        #         release 직후 잠시 진동 후 settle. 너무 크면 (≥30°) 완전히 넘어질 위험.
+        self.declare_parameter("place_cup_tilt_deg", 0.0)
+        # place_plus_y_auto_swing:
+        #   true 면 cup wide 가 +Y 영역으로 누운 케이스(=sin(cup_yaw_base) > 임계값)
+        #   를 자동 감지하여 아래 plus_y_* 파라미터들을 일괄 적용.
+        #   - 감지 됨: side, base_yaw, tilt 가 plus_y_* 값으로 override.
+        #   - 감지 안 됨: 사용자가 지정한(또는 기본) 파라미터 그대로 사용.
+        #   한 명령으로 양쪽 케이스(cup wide ±Y) 모두 안전 처리하기 위함.
+        self.declare_parameter("place_plus_y_auto_swing", False)
+        # 아래 3개는 위 auto_swing 이 True 이고 +Y 감지된 경우에만 적용.
+        # 기본값은 사용자 검증된 조합 (left / +60° / 25°).
+        self.declare_parameter("place_plus_y_side", "left")
+        self.declare_parameter("place_plus_y_base_yaw_deg", 60.0)
+        self.declare_parameter("place_plus_y_cup_tilt_deg", 25.0)
+        # multi_cup:
+        #   true 면 한 프레임에 여러 넘어진 cup 이 있어도 모두 순차 처리.
+        #   /fallen_cup/cups_pose2d, /fallen_cup/cups_grasp_poses (Phase 1) 토픽 사용.
+        #   가까운 cup 부터 한 개씩 pick → in-place stand → HOME 복귀 → 재sense 반복.
+        #   false (기본) 면 기존 single-cup 동작 (/fallen_cup/grasp_pose, /pose2d).
+        self.declare_parameter("multi_cup", False)
+        # 안전 / 클러스터링 파라미터
+        self.declare_parameter("multi_cup_max_iterations", 10)
+        self.declare_parameter("multi_cup_cluster_radius_m", 0.04)
+        self.declare_parameter("multi_cup_blacklist_radius_m", 0.06)
+        self.declare_parameter("multi_cup_min_samples_per_cluster", 3)
         # sim: 카메라/그리퍼 하드웨어 없이 MoveIt virtual에서 동작 시각화
         self.declare_parameter("sim", False)
         self.declare_parameter("sim_cup_x", 0.40)
@@ -314,6 +395,51 @@ class StandFallenCupNode(Node):
                 f"unknown place_flange_side '{self.place_flange_side}' → 'right' 사용"
             )
             self.place_flange_side = "right"
+        self.place_flange_yaw_deg = float(
+            self.get_parameter("place_flange_yaw_deg").value
+        )
+        self.place_flange_yaw_auto_extra_deg = float(
+            self.get_parameter("place_flange_yaw_auto_extra_deg").value
+        )
+        self.stand_cup_margin_m = float(
+            self.get_parameter("stand_cup_margin_m").value
+        )
+        self.place_base_yaw_deg = float(
+            self.get_parameter("place_base_yaw_deg").value
+        )
+        self.place_cup_tilt_deg = float(
+            self.get_parameter("place_cup_tilt_deg").value
+        )
+        self.place_plus_y_auto_swing = bool(
+            self.get_parameter("place_plus_y_auto_swing").value
+        )
+        self.place_plus_y_side = str(
+            self.get_parameter("place_plus_y_side").value
+        ).lower()
+        if self.place_plus_y_side not in ("right", "left"):
+            log.warn(
+                f"unknown place_plus_y_side '{self.place_plus_y_side}' → 'left' 사용"
+            )
+            self.place_plus_y_side = "left"
+        self.place_plus_y_base_yaw_deg = float(
+            self.get_parameter("place_plus_y_base_yaw_deg").value
+        )
+        self.place_plus_y_cup_tilt_deg = float(
+            self.get_parameter("place_plus_y_cup_tilt_deg").value
+        )
+        self.multi_cup = bool(self.get_parameter("multi_cup").value)
+        self.multi_cup_max_iterations = int(
+            self.get_parameter("multi_cup_max_iterations").value
+        )
+        self.multi_cup_cluster_radius_m = float(
+            self.get_parameter("multi_cup_cluster_radius_m").value
+        )
+        self.multi_cup_blacklist_radius_m = float(
+            self.get_parameter("multi_cup_blacklist_radius_m").value
+        )
+        self.multi_cup_min_samples_per_cluster = int(
+            self.get_parameter("multi_cup_min_samples_per_cluster").value
+        )
         self.cup_yaw_override_deg = float(
             self.get_parameter("cup_yaw_override_deg").value
         )
@@ -390,10 +516,19 @@ class StandFallenCupNode(Node):
         self.lin_params.max_acceleration_scaling_factor = 0.06   # 0.03 → 0.06
         self.lin_params.planning_time = 2.0
 
-        # 인식 결과 버퍼
+        # 인식 결과 버퍼 (single-cup)
         self.grasp_samples = []    # list of PoseStamped
         self.last_pose2d = None    # Float32MultiArray.data (latest)
         self.pose2d_samples = []   # yaw 샘플 (circular mean 용)
+
+        # 인식 결과 버퍼 (multi-cup, Phase 2)
+        self._latest_cups_pose2d = None     # list of dict per cup_id (yaw, conf 등)
+        self._cups_frame_samples = []       # list of frame dicts with cups list
+
+        # 활성 PLACE 좌표 (in-place stand 위해 multi-cup loop 가 override).
+        # 기본값은 모듈 상수 — single-cup 동작 변경 없음.
+        self._active_place_x = PLACE_X
+        self._active_place_y = PLACE_Y
 
         self.create_subscription(
             PoseStamped, "/fallen_cup/grasp_pose",
@@ -401,6 +536,13 @@ class StandFallenCupNode(Node):
         self.create_subscription(
             Float32MultiArray, "/fallen_cup/pose2d",
             self._pose2d_cb, 10)
+        # Multi-cup 토픽 (Phase 1 에서 pose node 가 publish)
+        self.create_subscription(
+            Float32MultiArray, "/fallen_cup/cups_pose2d",
+            self._cups_pose2d_cb, 10)
+        self.create_subscription(
+            PoseArray, "/fallen_cup/cups_grasp_poses",
+            self._cups_grasp_poses_cb, 10)
 
         # sim 모드: 가상 컵 marker
         self.cup_marker_pub = None
@@ -510,6 +652,205 @@ class StandFallenCupNode(Node):
             self.pose2d_samples.append(float(msg.data[6]))
             if len(self.pose2d_samples) > 30:
                 self.pose2d_samples.pop(0)
+
+    # ── Multi-cup 콜백 (Phase 2) ─────────────────
+    def _cups_pose2d_cb(self, msg: Float32MultiArray):
+        """/fallen_cup/cups_pose2d 콜백. layout = [{cup,N,N*13}, {field,13,13}].
+        N 개 cup 의 pose2d (cup_id, yaw, conf 등) 를 dict 리스트로 저장.
+        """
+        if len(msg.layout.dim) < 2 or msg.layout.dim[1].size != 13:
+            return
+        n = msg.layout.dim[0].size
+        if len(msg.data) != n * 13:
+            return
+        cups = []
+        for i in range(n):
+            row = msg.data[i * 13:(i + 1) * 13]
+            cups.append({
+                "cup_id": int(row[0]),
+                "yaw": float(row[7]),
+                "grip_px": (float(row[8]), float(row[9])),
+                "conf": float(row[10]),
+            })
+        self._latest_cups_pose2d = cups
+
+    def _cups_grasp_poses_cb(self, msg: PoseArray):
+        """/fallen_cup/cups_grasp_poses 콜백. 같은 프레임의 cups_pose2d 와 결합해
+        프레임 sample 생성. depth NaN cup 은 스킵.
+        """
+        if self._latest_cups_pose2d is None:
+            return
+        if len(msg.poses) != len(self._latest_cups_pose2d):
+            return  # 프레임 mismatch — 다음 callback 기다림
+        frame_cups = []
+        for i, pose in enumerate(msg.poses):
+            x = pose.position.x
+            if math.isnan(x) or math.isnan(pose.position.y) or math.isnan(pose.position.z):
+                continue
+            p_cam = np.array([
+                float(x), float(pose.position.y), float(pose.position.z)
+            ])
+            meta = self._latest_cups_pose2d[i]
+            frame_cups.append({
+                "cup_id": meta["cup_id"],
+                "p_cam": p_cam,
+                "yaw": meta["yaw"],
+                "conf": meta["conf"],
+            })
+        if frame_cups:
+            self._cups_frame_samples.append({
+                "stamp_sec": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+                "cups": frame_cups,
+            })
+            # 오래된 frame 정리 (메모리 무한 증가 방지)
+            if len(self._cups_frame_samples) > 200:
+                self._cups_frame_samples.pop(0)
+
+    # ── Multi-cup 헬퍼 ───────────────────────────
+    def _cluster_frame_samples(self, frames, radius_m):
+        """frame 별 cup 들을 카메라 frame 공간 근접도로 클러스터링.
+
+        각 클러스터 = 같은 물리적 cup 으로 추정되는 sample 모음.
+        반환: list of {"center_cam": np.array(3), "samples": list of cup sample}
+        """
+        clusters = []
+        for frame in frames:
+            for cup in frame["cups"]:
+                p = cup["p_cam"]
+                best_idx = -1
+                best_dist = float("inf")
+                for ci, cl in enumerate(clusters):
+                    d = float(np.linalg.norm(p - cl["center_cam"]))
+                    if d < best_dist:
+                        best_dist = d
+                        best_idx = ci
+                if best_idx >= 0 and best_dist < radius_m:
+                    cl = clusters[best_idx]
+                    cl["samples"].append(cup)
+                    n = len(cl["samples"])
+                    cl["center_cam"] = cl["center_cam"] * ((n - 1) / n) + p / n
+                else:
+                    clusters.append({
+                        "center_cam": p.copy(),
+                        "samples": [cup],
+                    })
+        return clusters
+
+    def _compute_cluster_target(self, cluster, T_base_cam):
+        """단일 클러스터에서 (p_base, cup_yaw_base, n_samples, R) 산출. 실패 시 None.
+        compute_target 의 cluster 버전 — buffer 대신 cluster["samples"] 사용.
+        """
+        log = self.get_logger()
+        samples = cluster["samples"]
+        if len(samples) < self.multi_cup_min_samples_per_cluster:
+            return None
+
+        ps = np.array([s["p_cam"] for s in samples])
+        p_cam = ps.mean(axis=0)
+
+        p_base = (T_base_cam @ np.append(p_cam, 1.0))[:3]
+        p_base[0] -= BASE_OFFSET_X
+        p_base[1] -= BASE_OFFSET_Y
+        p_base[2] -= BASE_OFFSET_Z
+
+        yaws = [s["yaw"] for s in samples]
+        m1 = circular_mean(yaws)
+        thresh = math.radians(30.0)
+        yaws_in = [y for y in yaws if abs(angular_diff(y, m1)) <= thresh]
+        if not yaws_in:
+            return None
+        cam_yaw = circular_mean(yaws_in)
+        R_val = circular_R(yaws_in)
+
+        v_cam = np.array([math.cos(cam_yaw), math.sin(cam_yaw), 0.0])
+        v_base = T_base_cam[:3, :3] @ v_cam
+        cup_yaw_base = math.atan2(v_base[1], v_base[0])
+
+        return (p_base, cup_yaw_base, len(samples), R_val)
+
+    def _sense_multi_targets(self, blacklist):
+        """SAMPLE_COLLECT_SEC 동안 cup frame sample 수집 → 클러스터링 → base 변환
+        → blacklist 필터 → base 거리 가까운 순으로 정렬한 후보 리스트 반환.
+
+        반환: list of dict {p_base, cup_yaw, n_samples, R}, 비어 있으면 [].
+        """
+        log = self.get_logger()
+        self._cups_frame_samples = []
+        self._latest_cups_pose2d = None
+
+        log.info(
+            f"[multi-cup] sense 시작 (max {SAMPLE_COLLECT_SEC}s, "
+            f"cluster_radius={self.multi_cup_cluster_radius_m * 1000:.0f}mm)"
+        )
+        t0 = time.time()
+        last_status = 0.0
+        while rclpy.ok() and time.time() - t0 < SAMPLE_COLLECT_SEC:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if time.time() - last_status > 1.0:
+                last_status = time.time()
+                log.info(
+                    f"[multi-cup] frames={len(self._cups_frame_samples)}"
+                )
+
+        if not self._cups_frame_samples:
+            log.warn("[multi-cup] frame sample 한 개도 못 받음")
+            return []
+
+        clusters = self._cluster_frame_samples(
+            self._cups_frame_samples, self.multi_cup_cluster_radius_m
+        )
+        log.info(
+            f"[multi-cup] frames={len(self._cups_frame_samples)}, "
+            f"clusters={len(clusters)} "
+            f"(min_samples={self.multi_cup_min_samples_per_cluster})"
+        )
+
+        T_base_ee = get_ee_matrix(self.robot)
+        T_ee_cam = self.gripper2cam
+        T_base_cam = T_base_ee @ T_ee_cam
+
+        candidates = []
+        for cl_idx, cluster in enumerate(clusters):
+            result = self._compute_cluster_target(cluster, T_base_cam)
+            if result is None:
+                log.info(
+                    f"[multi-cup] cluster {cl_idx} 스킵 "
+                    f"(samples={len(cluster['samples'])} < min)"
+                )
+                continue
+            p_base, cup_yaw, n_samples, R_val = result
+
+            # blacklist (이미 세운 cup) 체크
+            in_bl = False
+            for bx, by in blacklist:
+                if math.hypot(p_base[0] - bx, p_base[1] - by) < self.multi_cup_blacklist_radius_m:
+                    in_bl = True
+                    break
+            if in_bl:
+                log.info(
+                    f"[multi-cup] cluster {cl_idx} 스킵 "
+                    f"(blacklist hit @ ({p_base[0]:.3f},{p_base[1]:.3f}))"
+                )
+                continue
+
+            dist_from_base = math.hypot(p_base[0], p_base[1])
+            log.info(
+                f"[multi-cup] cluster {cl_idx}: "
+                f"p_base=({p_base[0]:.3f},{p_base[1]:.3f},{p_base[2]:.3f}) "
+                f"cup_yaw={math.degrees(cup_yaw):+.1f}° "
+                f"n={n_samples} R={R_val:.2f} "
+                f"dist_from_base={dist_from_base:.3f}m"
+            )
+            candidates.append({
+                "p_base": p_base,
+                "cup_yaw": cup_yaw,
+                "n_samples": n_samples,
+                "R": R_val,
+                "dist": dist_from_base,
+            })
+
+        candidates.sort(key=lambda c: c["dist"])
+        return candidates
 
     # ── 좌표 변환 ─────────────────────────
     def compute_target(self):
@@ -638,10 +979,14 @@ class StandFallenCupNode(Node):
         return joints
 
     # ── IK 잠금 헬퍼 ──────────────────────
-    def ik_state_with_current_seed(self, pose_stamped, timeout=1.0):
+    def ik_state_with_current_seed(self, pose_stamped, timeout=1.0,
+                                   seed_overrides=None):
         """
         현재 관절 상태를 seed로 IK를 풀어 RobotState를 만든다.
         목적: descend / lift에서 IK가 다른 branch를 골라 wrist가 회전하는 것 방지.
+        seed_overrides (dict[str, float] | None): 주어지면 현재 joint dict에
+          update해서 seed로 사용. 예: {"joint_1": 1.0472} → joint_1을 60°로 강제.
+          IK solver(KDL)는 seed 근처로 수렴하므로 desired branch 유도 효과.
         반환: 성공 시 RobotState, 실패 시 None.
         """
         log = self.get_logger()
@@ -649,8 +994,15 @@ class StandFallenCupNode(Node):
         with psm.read_only() as scene:
             current_joints = dict(scene.current_state.joint_positions)
 
+        if seed_overrides:
+            for jn, jv in seed_overrides.items():
+                if jn in current_joints:
+                    current_joints[jn] = float(jv)
+                else:
+                    log.warn(f"[ik-seed] unknown joint '{jn}' in overrides — 무시")
+
         target_state = RobotState(self.robot_model)
-        target_state.joint_positions = current_joints  # seed = 현재 관절
+        target_state.joint_positions = current_joints  # seed = 현재 관절 (+ overrides)
         target_state.update()
 
         ok = target_state.set_from_ik(
@@ -670,102 +1022,139 @@ class StandFallenCupNode(Node):
         return target_state
 
     # ── 메인 ──────────────────────────────
-    def run(self):
+    # ── HOME 복귀 헬퍼 (Phase 2) ─────────────────
+    def _return_to_session_home(self, final=False):
+        """session HOME 으로 복귀. OMPL → Pilz PTP fallback.
+        final=True 면 그리퍼 open + 시작 자세 대비 검증 로그까지 수행.
+        반환: True (성공), False (모든 시도 실패).
+        """
         log = self.get_logger()
+        home_back = RobotState(self.robot_model)
+        home_back.joint_positions = self._session_home_joints
+        home_back.update()
 
-        # controller action server 연결 대기
-        log.info("[Init] controller 연결 대기 3s")
-        time.sleep(3.0)
+        home_ok = plan_and_execute(self.robot, self.arm, log,
+                                   state_goal=home_back,
+                                   params=self.ompl_params)
+        if not home_ok:
+            log.warn("[Home] OMPL HOME 복귀 실패 — Pilz PTP로 재시도")
+            home_ok = plan_and_execute(self.robot, self.arm, log,
+                                       state_goal=home_back,
+                                       params=self.pilz_params)
+        if not final:
+            return home_ok
 
-        # 1) HOME 결정 + (필요 시) 이동
-        if self.use_current_as_home:
-            # 티치펜던트에서 설정한 현재 자세를 그대로 세션 HOME으로 채택.
-            # 초기 HOME 이동 없이 현재 joint state를 저장만 한다.
-            self._session_home_joints = self._read_current_joints()
-            log.info(
-                "[Init] use_current_as_home=true → 현재 자세를 세션 HOME으로 캡처 "
-                "(초기 HOME 이동 스킵)"
-            )
-            for jn, jv in self._session_home_joints.items():
-                log.info(f"  {jn} = {math.degrees(jv):+.2f}°")
-        else:
-            log.info("[Init] HOME 이동 (코드 HOME_JOINTS 사용)")
-            home_state = RobotState(self.robot_model)
-            home_state.joint_positions = HOME_JOINTS
-            home_state.update()
-            if not plan_and_execute(self.robot, self.arm, log,
-                                    state_goal=home_state,
-                                    params=self.ompl_params):
-                log.error("HOME 이동 실패 — 종료")
-                return
-            self._session_home_joints = dict(HOME_JOINTS)
-
-        # 시작 시점의 link_6 pose를 저장 (종료 시 동일한 자세로 복귀했는지 검증용)
-        self._start_T_base_ee = get_ee_matrix(self.robot)
-        sp = self._start_T_base_ee[:3, 3]
-        log.info(
-            f"[Init] HOME link_6 pose: "
-            f"pos=({sp[0]:.3f},{sp[1]:.3f},{sp[2]:.3f})"
-        )
-
-        # 2) 그리퍼 열기
+        # final: gripper open + 시작/종료 자세 비교
         self._gripper_move(GRIP_OPEN_WIDTH, GRIP_FORCE)
-        time.sleep(1.0)
-
-        if self.sim:
-            # sim: 인식 우회, 파라미터로 받은 가상 컵 좌표 사용
+        time.sleep(0.5)
+        if hasattr(self, "_start_T_base_ee"):
+            end_T_base_ee = get_ee_matrix(self.robot)
+            dp = end_T_base_ee[:3, 3] - self._start_T_base_ee[:3, 3]
+            dp_norm = float(np.linalg.norm(dp))
+            dR = end_T_base_ee[:3, :3] - self._start_T_base_ee[:3, :3]
+            dR_norm = float(np.linalg.norm(dR))
+            ep = end_T_base_ee[:3, 3]
             log.info(
-                f"[sim] sense 스킵, cup_base=({self.sim_cup_x:.3f},"
-                f"{self.sim_cup_y:.3f},{self.sim_cup_z:.3f}), "
-                f"yaw={self.sim_cup_yaw_deg:.1f}deg"
+                f"[Final] 종료 link_6 pos=({ep[0]:.3f},{ep[1]:.3f},{ep[2]:.3f}) "
+                f"| Δpos={dp_norm*1000:.1f}mm, Δrot={dR_norm:.3f}"
             )
-            p_base = np.array([self.sim_cup_x, self.sim_cup_y, self.sim_cup_z])
-            cup_yaw = math.radians(self.sim_cup_yaw_deg)
-        else:
-            # 2.5) HOME settle 대기 + sense 직전 버퍼 초기화
-            # (HOME 정착 진동/이전 transient 샘플 제거 → yaw 정확도 ↑)
-            log.info("[Sense] HOME settle 대기 1s")
-            time.sleep(1.0)
-            self.grasp_samples.clear()
-            self.pose2d_samples.clear()
-            self.last_pose2d = None
+            if dp_norm < 0.005 and dR_norm < 0.01:
+                log.info("[Final] ✓ 시작 자세와 종료 자세 일치")
+            else:
+                log.warn(
+                    "[Final] ⚠ 시작/종료 자세 차이 큼 — HOME 복귀가 완전히 안 됐을 수 있음"
+                )
+        if not home_ok:
+            log.error("[Final] HOME 복귀 모든 시도 실패 — 로봇 자세 수동 확인 필요")
+        return home_ok
 
-            # 3) 인식 결과 수집 (최대 SAMPLE_COLLECT_SEC, MIN_SAMPLES 모이면 조기 종료)
+    # ── Multi-cup loop (Phase 2) ─────────────────
+    def _run_multi_cup_loop(self):
+        """한 프레임에 여러 cup 이 있을 때 가까운 순서대로 in-place stand.
+
+        각 iteration:
+          1. (it>0) HOME 복귀 (재sense 위해 camera 시야 확보)
+          2. settle 대기
+          3. _sense_multi_targets() — cups 토픽 sample 수집 + 클러스터링 +
+             blacklist 필터 + base 거리 정렬
+          4. 후보 없으면 종료
+          5. 가장 가까운 cup 선택, _active_place_x/y = cup 원위치
+          6. _pick_and_handle_cup() 호출
+          7. 성공 시 blacklist 에 PLACE 추가, 실패 시 skip
+        루프 종료 후 final HOME 복귀.
+        """
+        log = self.get_logger()
+        placed = []  # blacklist: list of (x, y) base frame — 이미 세운 cup 위치
+
+        for it in range(self.multi_cup_max_iterations):
             log.info(
-                f"[Sense] /fallen_cup/grasp_pose 수집 시작 "
-                f"(최대 {SAMPLE_COLLECT_SEC}s, 최소 {MIN_SAMPLES}개)"
+                f"[multi-cup] === Iteration {it + 1}/"
+                f"{self.multi_cup_max_iterations} ==="
             )
-            t0 = time.time()
-            last_status_log = 0.0
-            while rclpy.ok() and time.time() - t0 < SAMPLE_COLLECT_SEC:
-                rclpy.spin_once(self, timeout_sec=0.05)
-                if len(self.grasp_samples) >= MIN_SAMPLES:
-                    log.info(
-                        f"[Sense] 샘플 {len(self.grasp_samples)}개 확보 "
-                        f"({time.time() - t0:.1f}s) — 조기 종료"
-                    )
+
+            # 첫 iter 는 직전에 HOME init 끝났으니 스킵.
+            # 이후 iter 는 HOME 복귀해서 camera 시야 확보.
+            if it > 0:
+                log.info("[multi-cup] HOME 복귀 (재sense 전)")
+                if not self._return_to_session_home(final=False):
+                    log.error("[multi-cup] HOME 복귀 실패 — 루프 중단")
                     break
-                # 1초마다 진행상황 로그
-                if time.time() - last_status_log > 1.0:
-                    log.info(
-                        f"[Sense] grasp_samples={len(self.grasp_samples)}, "
-                        f"pose2d={'received' if self.last_pose2d else 'NONE'}"
-                    )
-                    last_status_log = time.time()
 
-            if len(self.grasp_samples) == 0:
-                log.error("=== /fallen_cup/grasp_pose 한 개도 못 받음 ===")
-                log.error("  1) 인식 노드가 use_depth:=true 인가?")
-                log.error("  2) ros2 topic hz /fallen_cup/grasp_pose 직접 확인")
-                log.error("  3) 컵이 카메라 화각 안, 거리 30~80cm, depth가 잡히는 표면인가?")
-                return
+            log.info("[multi-cup] sense settle 대기 1.0s")
+            time.sleep(1.0)
 
-            target = self.compute_target()
-            if target is None:
-                log.error("target 계산 실패 — 종료")
-                return
-            p_base, cup_yaw = target
+            candidates = self._sense_multi_targets(placed)
+            if not candidates:
+                log.info("[multi-cup] 처리할 cup 없음 → 루프 종료")
+                break
 
+            target = candidates[0]  # 가장 가까운 cup
+            p_base = target["p_base"]
+            cup_yaw = target["cup_yaw"]
+            log.info(
+                f"[multi-cup] 선택: p_base=("
+                f"{p_base[0]:.3f},{p_base[1]:.3f},{p_base[2]:.3f}) "
+                f"cup_yaw={math.degrees(cup_yaw):+.1f}° "
+                f"dist={target['dist']:.3f}m (남은 후보 {len(candidates) - 1}개)"
+            )
+
+            # in-place stand: PLACE = cup 원위치
+            self._active_place_x = float(p_base[0])
+            self._active_place_y = float(p_base[1])
+            log.info(
+                f"[multi-cup] PLACE = ({self._active_place_x:.3f}, "
+                f"{self._active_place_y:.3f}) (in-place stand)"
+            )
+
+            # cup_yaw override 가 set 되어 있으면 그대로 적용 (테스트 용도).
+            # 정상 mode 에서는 NaN 이라 무시.
+            ok = self._pick_and_handle_cup(p_base, cup_yaw)
+            if not ok:
+                log.warn(
+                    f"[multi-cup] cup 처리 실패 — 다음 iteration 시도 "
+                    "(blacklist 추가 안 함, 다음 sense 에서 재시도 가능)"
+                )
+                continue
+
+            placed.append((self._active_place_x, self._active_place_y))
+            log.info(
+                f"[multi-cup] cup 처리 완료. blacklist 누적: {len(placed)}개"
+            )
+
+        log.info(
+            f"[multi-cup] 루프 종료. 총 처리: {len(placed)}개 / "
+            f"max_iter={self.multi_cup_max_iterations}"
+        )
+        # final HOME 복귀 + 검증
+        log.info("[Final] HOME 복귀 (시작 자세로)")
+        self._return_to_session_home(final=True)
+
+    def _pick_and_handle_cup(self, p_base, cup_yaw):
+        """단일 cup 의 cup_yaw override → approach → descend → close → lift →
+        drop/place (in-place stand) 전체 시퀀스. self._active_place_x/y 를 PLACE 좌표로 사용.
+        반환: True (성공 또는 dry-run 정상 종료), False (모션 실패).
+        """
+        log = self.get_logger()
         # cup_yaw override (dry-run/정적 테스트용)
         if not math.isnan(self.cup_yaw_override_deg):
             cup_yaw = math.radians(self.cup_yaw_override_deg)
@@ -795,7 +1184,7 @@ class StandFallenCupNode(Node):
                 self.robot, self.arm, log,
                 pose_goal=make_pose(bx, by, approach_z, ori),
                 params=self.pilz_params):
-            return
+            return False
 
         if self.dry_run:
             log.warn("=== DRY-RUN: approach 자세 도달. 30초 정지 ===")
@@ -805,7 +1194,7 @@ class StandFallenCupNode(Node):
             while rclpy.ok() and time.time() - t0 < 30.0:
                 rclpy.spin_once(self, timeout_sec=0.1)
             log.info("=== DRY-RUN 종료 ===")
-            return
+            return True
 
         # 5) DESCEND — IK를 현재 관절 seed로 잠가서 wrist 회전 차단
         descend_z = flange_at_grip + GRIP_Z_MARGIN
@@ -816,7 +1205,7 @@ class StandFallenCupNode(Node):
         descend_state = self.ik_state_with_current_seed(descend_pose)
         if descend_state is None:
             log.error("descend IK 실패 — 종료")
-            return
+            return False
         log.info(
             f"[2] Descend @ z={descend_z:.3f} "
             "(joint goal, orientation 잠금)"
@@ -825,7 +1214,7 @@ class StandFallenCupNode(Node):
                 self.robot, self.arm, log,
                 state_goal=descend_state,
                 params=self.pilz_params):
-            return
+            return False
 
         # 6) CLOSE
         log.info("[3] Gripper CLOSE")
@@ -855,13 +1244,13 @@ class StandFallenCupNode(Node):
         lift_state = self.ik_state_with_current_seed(lift_pose)
         if lift_state is None:
             log.error("lift IK 실패 — 종료")
-            return
+            return False
         log.info(f"[4] Lift @ z={LIFT_Z:.3f} (joint goal, orientation 잠금)")
         if not plan_and_execute(
                 self.robot, self.arm, log,
                 state_goal=lift_state,
                 params=self.pilz_params):
-            return
+            return False
 
         log.info(f"[Hold] {LIFT_HOLD_SEC}s 대기 (컵 매달림 안정화)")
         time.sleep(LIFT_HOLD_SEC)
@@ -878,6 +1267,32 @@ class StandFallenCupNode(Node):
 
         elif self.mode == "place":
             # === 컵을 수직(wide 끝이 바닥)으로 세우기 ===
+
+            # (pre-a) place_plus_y_auto_swing — cup wide 가 +Y 영역으로 누운 경우
+            #   자동으로 swing strategy 발동 (side / base_yaw / cup_tilt 일괄 override).
+            #   감지: sin(cup_yaw) > PLUS_Y_DETECT_SIN_THRESHOLD.
+            #   미감지 시 사용자가 명시한(또는 기본) 파라미터 그대로 사용.
+            if self.place_plus_y_auto_swing:
+                sin_cup = math.sin(cup_yaw)
+                if sin_cup > PLUS_Y_DETECT_SIN_THRESHOLD:
+                    log.info(
+                        f"[plus-y-auto] cup_yaw={math.degrees(cup_yaw):+.1f}° "
+                        f"(sin={sin_cup:.3f}) > thr={PLUS_Y_DETECT_SIN_THRESHOLD} → "
+                        "swing strategy 발동: "
+                        f"side={self.place_plus_y_side}, "
+                        f"base_yaw={self.place_plus_y_base_yaw_deg:+.1f}°, "
+                        f"tilt={self.place_plus_y_cup_tilt_deg:+.1f}°"
+                    )
+                    self.place_flange_side = self.place_plus_y_side
+                    self.place_base_yaw_deg = self.place_plus_y_base_yaw_deg
+                    self.place_cup_tilt_deg = self.place_plus_y_cup_tilt_deg
+                else:
+                    log.info(
+                        f"[plus-y-auto] cup_yaw={math.degrees(cup_yaw):+.1f}° "
+                        f"(sin={sin_cup:.3f}) ≤ thr → swing 미발동, "
+                        "기본 파라미터 유지"
+                    )
+
             # YAW_OFFSET_DEG 값에 무관하도록 cross-product 기반 axis-angle 회전 사용.
             # cup_dir_base (lift 시 컵 narrow→wide 방향) 를 base의 -Z 방향에 맞추는
             # 최소 회전 R_align 을 구하고, R_stand = R_align @ R_lift_mat.
@@ -941,10 +1356,46 @@ class StandFallenCupNode(Node):
             ez_xy_norm = float(np.linalg.norm(EE_Z_after[:2]))
             if ez_xy_norm > 1e-6:
                 cur_angle = math.atan2(EE_Z_after[1], EE_Z_after[0])
+                # baseline: side에 따른 ±90° (기존 동작)
                 if self.place_flange_side == "right":
-                    target_angle = math.pi / 2      # EE_Z = +Y
+                    baseline_target = math.pi / 2      # EE_Z = +Y
                 else:  # "left"
-                    target_angle = -math.pi / 2     # EE_Z = -Y
+                    baseline_target = -math.pi / 2     # EE_Z = -Y
+
+                # target_angle 결정:
+                #   1) place_flange_yaw_deg 가 set → 그 값을 직접 사용 (명시 override)
+                #   2) place_flange_yaw_auto_extra_deg 가 set 이고
+                #      provisional twist 가 PRE_TWIST_THRESHOLD_DEG 를 넘는 "문제 케이스"
+                #      (= 컵 wide가 강제 방향과 반대로 누움) → baseline + sign*extra
+                #   3) 그 외 → baseline 그대로
+                if not math.isnan(self.place_flange_yaw_deg):
+                    target_angle = math.radians(self.place_flange_yaw_deg)
+                    log.info(
+                        f"[place-yaw] override → target_angle="
+                        f"{math.degrees(target_angle):+.1f}°"
+                    )
+                else:
+                    prov_twist = baseline_target - cur_angle
+                    prov_twist = math.atan2(math.sin(prov_twist),
+                                            math.cos(prov_twist))
+                    prov_twist_deg = math.degrees(prov_twist)
+                    if (not math.isnan(self.place_flange_yaw_auto_extra_deg)
+                            and abs(prov_twist_deg) > PRE_TWIST_THRESHOLD_DEG):
+                        sign = 1.0 if baseline_target >= 0.0 else -1.0
+                        extra = sign * math.radians(
+                            self.place_flange_yaw_auto_extra_deg
+                        )
+                        target_angle = baseline_target + extra
+                        log.info(
+                            f"[place-yaw] auto-extra 발동 "
+                            f"(|prov_twist|={abs(prov_twist_deg):.1f}° > "
+                            f"{PRE_TWIST_THRESHOLD_DEG:.0f}°): target_angle "
+                            f"{math.degrees(baseline_target):+.1f}° → "
+                            f"{math.degrees(target_angle):+.1f}°"
+                        )
+                    else:
+                        target_angle = baseline_target
+
                 twist = target_angle - cur_angle
                 twist = math.atan2(math.sin(twist), math.cos(twist))
                 cz, sz = math.cos(twist), math.sin(twist)
@@ -955,9 +1406,40 @@ class StandFallenCupNode(Node):
                 ])
                 R_stand = R_twist @ R_pre_twist
                 twist_deg = math.degrees(twist)
+                stand_target_angle = target_angle  # tilt 축 계산용 보관
             else:
                 R_stand = R_pre_twist
                 twist_deg = 0.0
+                stand_target_angle = None
+
+            # (b.6) place_cup_tilt_deg — cup 을 vertical 에서 -EE_Z 방향으로 α° 기울임.
+            # 회전축 = (-sin target, cos target, 0)  (base XY 수평면에서 EE_Z를 +90° 회전)
+            # 회전 적용: R_stand ← R_tilt @ R_stand
+            # 효과: EE_Z 가 (cos·target·cos α, sin·target·cos α, -sin α) 로 변화 →
+            #       flange Z 가 +TOOL_LENGTH·sin α 만큼 상승 (closing_z 고정 시).
+            # closing_z 도 cos α 보정 (cup 의 vertical projection 이 짧아지므로 더 낮은 위치
+            # 에서 release).
+            tilt_alpha_rad = math.radians(self.place_cup_tilt_deg)
+            if abs(tilt_alpha_rad) > 1e-6 and stand_target_angle is not None:
+                tilt_axis = np.array([
+                    -math.sin(stand_target_angle),
+                    math.cos(stand_target_angle),
+                    0.0,
+                ])
+                K = np.array([
+                    [0.0, -tilt_axis[2], tilt_axis[1]],
+                    [tilt_axis[2], 0.0, -tilt_axis[0]],
+                    [-tilt_axis[1], tilt_axis[0], 0.0],
+                ])
+                R_tilt = (np.eye(3)
+                          + math.sin(tilt_alpha_rad) * K
+                          + (1.0 - math.cos(tilt_alpha_rad)) * (K @ K))
+                R_stand = R_tilt @ R_stand
+                log.info(
+                    f"[cup-tilt] α={self.place_cup_tilt_deg:+.1f}° 적용 → "
+                    f"예상 flange Z 상승 ≈ "
+                    f"{TOOL_LENGTH_M * math.sin(tilt_alpha_rad) * 1000:+.0f}mm"
+                )
 
             sqx, sqy, sqz, sqw = rotmat_to_quat_xyzw(R_stand)
             stand_ori = {"x": sqx, "y": sqy, "z": sqz, "w": sqw}
@@ -972,24 +1454,75 @@ class StandFallenCupNode(Node):
             # closing plane을 (PLACE_X, PLACE_Y, TABLE_Z+CUP_HEIGHT+margin) 로
             # → flange = closing_plane - TOOL_LENGTH_M * EE_Z_in_base
             EE_Z_stand = R_stand[:, 2]
-            closing_z  = TABLE_Z + CUP_HEIGHT + STAND_CUP_MARGIN_M
-            stand_fx   = PLACE_X - TOOL_LENGTH_M * EE_Z_stand[0]
-            stand_fy   = PLACE_Y - TOOL_LENGTH_M * EE_Z_stand[1]
+            # cup이 α° 기울어진 경우 cup axis 의 vertical projection 이 cos α 배가 됨.
+            # 따라서 cup top(=closing_plane) 도 그만큼 낮춰서 cup 바닥이 TABLE_Z+margin 에
+            # 안착하도록.
+            closing_z  = (TABLE_Z
+                          + math.cos(tilt_alpha_rad) * CUP_HEIGHT
+                          + self.stand_cup_margin_m)
+            stand_fx   = self._active_place_x - TOOL_LENGTH_M * EE_Z_stand[0]
+            stand_fy   = self._active_place_y - TOOL_LENGTH_M * EE_Z_stand[1]
             stand_fz   = closing_z - TOOL_LENGTH_M * EE_Z_stand[2]
 
             log.info(
                 f"[5] place + pitch tilt: "
-                f"closing=({PLACE_X:+.3f},{PLACE_Y:+.3f},{closing_z:+.3f}), "
+                f"closing=({self._active_place_x:+.3f},{self._active_place_y:+.3f},{closing_z:+.3f}) "
+                f"[margin={self.stand_cup_margin_m:+.3f}m], "
                 f"flange=({stand_fx:+.3f},{stand_fy:+.3f},{stand_fz:+.3f}), "
                 f"EE_Z_base=({EE_Z_stand[0]:+.2f},{EE_Z_stand[1]:+.2f},{EE_Z_stand[2]:+.2f})"
             )
+
+            # (d.4) place_base_yaw_deg 가 set이면 standing/retreat IK seed에 joint_1 강제.
+            # 동일 override를 pre-twist IK에도 전달해서 pre-twist가 joint_1을 "자연스러운"
+            # branch로 되돌리는 것을 막음.
+            place_seed_overrides = None
+            if not math.isnan(self.place_base_yaw_deg):
+                place_seed_overrides = {
+                    "joint_1": math.radians(self.place_base_yaw_deg)
+                }
+                log.info(
+                    f"[place-base-yaw] IK seed override: "
+                    f"joint_1 = {self.place_base_yaw_deg:+.1f}° "
+                    "(pre-twist / standing / retreat 공통 적용)"
+                )
+
+            # (d.45) pre-base-yaw — joint_1을 lift 높이에서 사전 회전
+            #   목적: standing motion 의 joint_1 변화량을 줄여서 trajectory 안정화 +
+            #         elbow 가 target joint_1 방향(workspace 밖)으로 확실히 swing.
+            #   동작: 현재 joint dict 의 joint_1만 target 으로 교체, joints 2~6 유지.
+            #         joint-space PTP로 이동 → EE는 lift 높이(z=0.45m) 에서 호 그리며 swing.
+            #         테이블에서 안전한 높이라 swing 도중 충돌 가능성 낮음.
+            #   주의: 큰 각(예 ±90°+) 은 EE가 base 뒤쪽으로 가서 SAFE workspace 위반 가능.
+            #         처음엔 ±45° 정도로 시작.
+            if place_seed_overrides is not None:
+                cur_joints = self._read_current_joints()
+                cur_j1 = float(cur_joints.get("joint_1", 0.0))
+                target_j1 = float(place_seed_overrides["joint_1"])
+                log.info(
+                    f"[pre-base-yaw] joint_1 {math.degrees(cur_j1):+.1f}° → "
+                    f"{math.degrees(target_j1):+.1f}° @ lift z={LIFT_Z:.2f}m "
+                    f"(Δ={math.degrees(target_j1 - cur_j1):+.1f}°)"
+                )
+                pre_base_joints = dict(cur_joints)
+                pre_base_joints["joint_1"] = target_j1
+                pre_base_state = RobotState(self.robot_model)
+                pre_base_state.joint_positions = pre_base_joints
+                pre_base_state.update()
+                ok_pby = plan_and_execute(
+                    self.robot, self.arm, log,
+                    state_goal=pre_base_state,
+                    params=self.pilz_params,
+                )
+                if not ok_pby:
+                    log.warn(
+                        "[pre-base-yaw] 사전 회전 실패 — standing seed override 만 가지고 fallback"
+                    )
 
             # (d.5) 사전 base_Z 회전 — twist가 크면(cup wide가 +Y인 경우 ≈180°),
             # standing motion에서 (twist + tilt + translate)가 한 plan에 묶여 elbow가
             # 위로 들리는 high-arc 궤적이 나옴. twist만 먼저 lift 위치에서 적용해
             # cup을 수평인 채로 cup_dir만 뒤집어 두면, 이후 standing motion은 cup wide
             # 가 -Y인 경우와 기하학적으로 동일해져 깔끔한 tilt+translate만 남음.
-            PRE_TWIST_THRESHOLD_DEG = 90.0
             if abs(twist_deg) > PRE_TWIST_THRESHOLD_DEG:
                 R_pre_only = R_twist @ R_lift_mat  # tilt 없이 base_Z twist만
                 pqx, pqy, pqz, pqw = rotmat_to_quat_xyzw(R_pre_only)
@@ -1004,7 +1537,9 @@ class StandFallenCupNode(Node):
                     f"@ ({pre_x:+.3f},{pre_y:+.3f},{pre_z:+.3f})"
                 )
                 pre_pose = make_pose(pre_x, pre_y, pre_z, pre_ori)
-                pre_state = self.ik_state_with_current_seed(pre_pose, timeout=2.0)
+                pre_state = self.ik_state_with_current_seed(
+                    pre_pose, timeout=2.0, seed_overrides=place_seed_overrides
+                )
                 if pre_state is not None:
                     ok_pre = plan_and_execute(
                         self.robot, self.arm, log,
@@ -1022,8 +1557,19 @@ class StandFallenCupNode(Node):
 
             # (e) lift → standing 한 번에 plan (IK seed 우선, 실패 시 pose goal)
             stand_pose  = make_pose(stand_fx, stand_fy, stand_fz, stand_ori)
-            stand_state = self.ik_state_with_current_seed(stand_pose, timeout=2.0)
+            stand_state = self.ik_state_with_current_seed(
+                stand_pose, timeout=2.0, seed_overrides=place_seed_overrides
+            )
             if stand_state is not None:
+                if place_seed_overrides is not None:
+                    final_j1 = float(stand_state.joint_positions.get(
+                        "joint_1", float("nan")
+                    ))
+                    log.info(
+                        f"[place-base-yaw] IK 수렴 joint_1 = "
+                        f"{math.degrees(final_j1):+.1f}° "
+                        f"(target {self.place_base_yaw_deg:+.1f}°)"
+                    )
                 ok = plan_and_execute(self.robot, self.arm, log,
                                       state_goal=stand_state,
                                       params=self.pilz_params)
@@ -1034,13 +1580,13 @@ class StandFallenCupNode(Node):
                                       params=self.pilz_params)
             if not ok:
                 log.error("standing 동작 실패 — 종료")
-                return
+                return False
 
             # (f) release
             log.info("[6] 그리퍼 open (cup release at standing)")
             self._gripper_move(GRIP_OPEN_WIDTH, GRIP_FORCE)
             if self.sim:
-                self._cup_place_xy = (PLACE_X, PLACE_Y)
+                self._cup_place_xy = (self._active_place_x, self._active_place_y)
                 self._cup_state = "placed"
                 log.info("[sim] cup placed (서있음)")
             time.sleep(1.0)
@@ -1048,7 +1594,9 @@ class StandFallenCupNode(Node):
             # (g) retreat (위로 — 그리퍼 stand orientation 유지)
             log.info(f"[7] 후퇴 위로 @ z={LIFT_Z:.3f}")
             retreat_pose  = make_pose(stand_fx, stand_fy, LIFT_Z, stand_ori)
-            retreat_state = self.ik_state_with_current_seed(retreat_pose, timeout=2.0)
+            retreat_state = self.ik_state_with_current_seed(
+                retreat_pose, timeout=2.0, seed_overrides=place_seed_overrides
+            )
             if retreat_state is not None:
                 plan_and_execute(self.robot, self.arm, log,
                                  state_goal=retreat_state,
@@ -1058,6 +1606,118 @@ class StandFallenCupNode(Node):
                                  pose_goal=retreat_pose,
                                  params=self.pilz_params)
             log.info("=== place (방법2: pitch tilt) 완료 ===")
+
+        return True
+
+    # ──────────────────────────────────────────
+
+    def run(self):
+        log = self.get_logger()
+
+        # controller action server 연결 대기
+        log.info("[Init] controller 연결 대기 3s")
+        time.sleep(3.0)
+
+        # 1) HOME 결정 + (필요 시) 이동
+        if self.use_current_as_home:
+            # 티치펜던트에서 설정한 현재 자세를 그대로 세션 HOME으로 채택.
+            # 초기 HOME 이동 없이 현재 joint state를 저장만 한다.
+            self._session_home_joints = self._read_current_joints()
+            log.info(
+                "[Init] use_current_as_home=true → 현재 자세를 세션 HOME으로 캡처 "
+                "(초기 HOME 이동 스킵)"
+            )
+            for jn, jv in self._session_home_joints.items():
+                log.info(f"  {jn} = {math.degrees(jv):+.2f}°")
+        else:
+            log.info("[Init] HOME 이동 (코드 HOME_JOINTS 사용)")
+            home_state = RobotState(self.robot_model)
+            home_state.joint_positions = HOME_JOINTS
+            home_state.update()
+            if not plan_and_execute(self.robot, self.arm, log,
+                                    state_goal=home_state,
+                                    params=self.ompl_params):
+                log.error("HOME 이동 실패 — 종료")
+                return
+            self._session_home_joints = dict(HOME_JOINTS)
+
+        # 시작 시점의 link_6 pose를 저장 (종료 시 동일한 자세로 복귀했는지 검증용)
+        self._start_T_base_ee = get_ee_matrix(self.robot)
+        sp = self._start_T_base_ee[:3, 3]
+        log.info(
+            f"[Init] HOME link_6 pose: "
+            f"pos=({sp[0]:.3f},{sp[1]:.3f},{sp[2]:.3f})"
+        )
+
+        # 2) 그리퍼 열기
+        self._gripper_move(GRIP_OPEN_WIDTH, GRIP_FORCE)
+        time.sleep(1.0)
+
+        # multi-cup mode 분기: 별도 loop 가 sense + handle 을 반복.
+        # loop 자체가 final HOME 복귀까지 수행하므로 여기서 return.
+        if self.multi_cup and not self.sim:
+            self._run_multi_cup_loop()
+            return
+
+        if self.sim:
+            # sim: 인식 우회, 파라미터로 받은 가상 컵 좌표 사용
+            log.info(
+                f"[sim] sense 스킵, cup_base=({self.sim_cup_x:.3f},"
+                f"{self.sim_cup_y:.3f},{self.sim_cup_z:.3f}), "
+                f"yaw={self.sim_cup_yaw_deg:.1f}deg"
+            )
+            p_base = np.array([self.sim_cup_x, self.sim_cup_y, self.sim_cup_z])
+            cup_yaw = math.radians(self.sim_cup_yaw_deg)
+        else:
+            # 2.5) HOME settle 대기 + sense 직전 버퍼 초기화
+            # (HOME 정착 진동/이전 transient 샘플 제거 → yaw 정확도 ↑)
+            log.info("[Sense] HOME settle 대기 1s")
+            time.sleep(1.0)
+            self.grasp_samples.clear()
+            self.pose2d_samples.clear()
+            self.last_pose2d = None
+
+            # 3) 인식 결과 수집 (최대 SAMPLE_COLLECT_SEC, MIN_SAMPLES 모이면 조기 종료)
+            log.info(
+                f"[Sense] /fallen_cup/grasp_pose 수집 시작 "
+                f"(최대 {SAMPLE_COLLECT_SEC}s, 최소 {MIN_SAMPLES}개)"
+            )
+            t0 = time.time()
+            last_status_log = 0.0
+            while rclpy.ok() and time.time() - t0 < SAMPLE_COLLECT_SEC:
+                rclpy.spin_once(self, timeout_sec=0.05)
+                if len(self.grasp_samples) >= MIN_SAMPLES:
+                    log.info(
+                        f"[Sense] 샘플 {len(self.grasp_samples)}개 확보 "
+                        f"({time.time() - t0:.1f}s) — 조기 종료"
+                    )
+                    break
+                # 1초마다 진행상황 로그
+                if time.time() - last_status_log > 1.0:
+                    log.info(
+                        f"[Sense] grasp_samples={len(self.grasp_samples)}, "
+                        f"pose2d={'received' if self.last_pose2d else 'NONE'}"
+                    )
+                    last_status_log = time.time()
+
+            if len(self.grasp_samples) == 0:
+                log.error("=== /fallen_cup/grasp_pose 한 개도 못 받음 ===")
+                log.error("  1) 인식 노드가 use_depth:=true 인가?")
+                log.error("  2) ros2 topic hz /fallen_cup/grasp_pose 직접 확인")
+                log.error("  3) 컵이 카메라 화각 안, 거리 30~80cm, depth가 잡히는 표면인가?")
+                return
+
+            target = self.compute_target()
+            if target is None:
+                log.error("target 계산 실패 — 종료")
+                return
+            p_base, cup_yaw = target
+
+        # single-cup mode: 기본 PLACE 좌표 사용
+        self._active_place_x = PLACE_X
+        self._active_place_y = PLACE_Y
+        if not self._pick_and_handle_cup(p_base, cup_yaw):
+            return
 
         # 9) HOME 복귀 — 시작과 동일한 자세로 강제 복귀 (재시도 + 검증)
         log.info("[Final] HOME 복귀 (시작 자세로)")

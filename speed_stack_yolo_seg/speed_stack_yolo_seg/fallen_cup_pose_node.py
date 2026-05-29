@@ -11,8 +11,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
-from std_msgs.msg import Float32MultiArray
-from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float32MultiArray, MultiArrayDimension
+from geometry_msgs.msg import PoseStamped, PoseArray, Pose
 
 from ultralytics import YOLO
 
@@ -119,6 +119,9 @@ class FallenCupPoseNode(Node):
         self.declare_parameter("debug_image_topic", "/fallen_cup/debug_image")
         self.declare_parameter("pose2d_topic", "/fallen_cup/pose2d")
         self.declare_parameter("grasp_pose_topic", "/fallen_cup/grasp_pose")
+        # 신규 multi-cup 토픽 (Phase 1)
+        self.declare_parameter("cups_pose2d_topic", "/fallen_cup/cups_pose2d")
+        self.declare_parameter("cups_grasp_poses_topic", "/fallen_cup/cups_grasp_poses")
 
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("conf", 0.25)
@@ -166,6 +169,10 @@ class FallenCupPoseNode(Node):
         self.debug_image_topic = str(self.get_parameter("debug_image_topic").value)
         self.pose2d_topic = str(self.get_parameter("pose2d_topic").value)
         self.grasp_pose_topic = str(self.get_parameter("grasp_pose_topic").value)
+        self.cups_pose2d_topic = str(self.get_parameter("cups_pose2d_topic").value)
+        self.cups_grasp_poses_topic = str(
+            self.get_parameter("cups_grasp_poses_topic").value
+        )
 
         self.imgsz = int(self.get_parameter("imgsz").value)
         self.conf = float(self.get_parameter("conf").value)
@@ -245,6 +252,13 @@ class FallenCupPoseNode(Node):
         self.debug_pub = self.create_publisher(Image, self.debug_image_topic, 10)
         self.pose2d_pub = self.create_publisher(Float32MultiArray, self.pose2d_topic, 10)
         self.grasp_pose_pub = self.create_publisher(PoseStamped, self.grasp_pose_topic, 10)
+        # Multi-cup (Phase 1)
+        self.cups_pose2d_pub = self.create_publisher(
+            Float32MultiArray, self.cups_pose2d_topic, 10
+        )
+        self.cups_grasp_poses_pub = self.create_publisher(
+            PoseArray, self.cups_grasp_poses_topic, 10
+        )
 
         self.get_logger().info("fallen_cup_pose_node started.")
         self.get_logger().info(f"image_topic: {self.image_topic}")
@@ -408,6 +422,7 @@ class FallenCupPoseNode(Node):
     # Method 1: two face masks
     # -----------------------------
     def estimate_from_two_faces(self, detections):
+        """detections 전체에서 가장 점수 높은 한 pair 만 골라 estimate 반환 (legacy)."""
         if len(detections) < 2:
             return None
 
@@ -416,34 +431,38 @@ class FallenCupPoseNode(Node):
 
         for i in range(len(detections)):
             for j in range(i + 1, len(detections)):
-                a = detections[i]
-                b = detections[j]
-
-                ca = a["center"]
-                cb = b["center"]
-                dist = float(np.linalg.norm(ca - cb))
-
-                if dist < self.min_pair_distance_px:
+                score = self._two_face_pair_score(detections[i], detections[j])
+                if score is None:
                     continue
-                if dist > self.max_pair_distance_px:
-                    continue
-
-                da = max(a["diameter"], 1.0)
-                db = max(b["diameter"], 1.0)
-                ratio = max(da, db) / min(da, db)
-
-                # 크기 차이가 있고, 중심 간 거리가 긴 pair를 선호
-                score = ratio * dist * 0.5 * (a["conf"] + b["conf"])
-
                 if score > best_score:
                     best_score = score
-                    best_pair = (a, b)
+                    best_pair = (detections[i], detections[j])
 
         if best_pair is None:
             return None
 
-        a, b = best_pair
+        return self._make_two_face_estimate(best_pair[0], best_pair[1])
 
+    def _two_face_pair_score(self, a, b):
+        """pair (a, b)의 valid 여부 + score 계산. valid 아니면 None."""
+        ca = a["center"]
+        cb = b["center"]
+        dist = float(np.linalg.norm(ca - cb))
+
+        if dist < self.min_pair_distance_px:
+            return None
+        if dist > self.max_pair_distance_px:
+            return None
+
+        da = max(a["diameter"], 1.0)
+        db = max(b["diameter"], 1.0)
+        ratio = max(da, db) / min(da, db)
+
+        # 크기 차이가 있고, 중심 간 거리가 긴 pair를 선호
+        return ratio * dist * 0.5 * (a["conf"] + b["conf"])
+
+    def _make_two_face_estimate(self, a, b):
+        """두 detection (top+bottom face 후보) 으로부터 estimate dict 생성. 실패 시 None."""
         # 사용자가 정의한 가정:
         # 밑면 원 지름이 크고, 윗면 원 지름이 작다.
         if a["diameter"] >= b["diameter"]:
@@ -488,6 +507,56 @@ class FallenCupPoseNode(Node):
             "bottom_width_px": bottom_width_px,
             "confidence": 0.5 * (top["conf"] + bottom["conf"]),
         }
+
+    # -----------------------------
+    # Multi-cup: cup 마다 한 estimate
+    # -----------------------------
+    def estimate_all_cups(self, detections):
+        """전체 detections 에서 cup 별 estimate 리스트 반환.
+
+        - mode in (auto, two_face): greedy pairing 으로 가능한 모든 (top, bottom) pair
+          를 cup 으로 묶음. 한 detection 은 하나의 pair 에만 속함.
+        - mode in (auto, silhouette): two_face 에 사용되지 않은(또는 mode 가 silhouette
+          단독인 경우 전체) detection 각각에 silhouette PCA 적용.
+        - 각 estimate dict 에 cup_id 부여 (리스트 인덱스).
+        """
+        estimates = []
+        used_indices = set()
+
+        if self.mode in ("auto", "two_face") and len(detections) >= 2:
+            scored_pairs = []
+            for i in range(len(detections)):
+                for j in range(i + 1, len(detections)):
+                    s = self._two_face_pair_score(detections[i], detections[j])
+                    if s is not None:
+                        scored_pairs.append((s, i, j))
+
+            scored_pairs.sort(key=lambda t: t[0], reverse=True)
+            for s, i, j in scored_pairs:
+                if i in used_indices or j in used_indices:
+                    continue
+                est = self._make_two_face_estimate(detections[i], detections[j])
+                if est is None:
+                    continue
+                estimates.append(est)
+                used_indices.add(i)
+                used_indices.add(j)
+
+        if self.mode in ("auto", "silhouette"):
+            for i, det in enumerate(detections):
+                if i in used_indices:
+                    continue
+                est = self.estimate_from_silhouette(det)
+                if est is None:
+                    continue
+                estimates.append(est)
+                used_indices.add(i)
+
+        # cup_id = 리스트 인덱스 (간단히)
+        for idx, est in enumerate(estimates):
+            est["cup_id"] = idx
+
+        return estimates
 
     # -----------------------------
     # Method 2: one full silhouette mask
@@ -695,29 +764,32 @@ class FallenCupPoseNode(Node):
             self.publish_debug(debug, msg.header)
             return
 
-        estimate = None
+        # Multi-cup: target_detections 전체에 대해 cup 마다 estimate.
+        # 빈 리스트면 (estimate 실패) early return.
+        estimates = self.estimate_all_cups(target_detections)
 
-        if self.mode in ["auto", "two_face"]:
-            estimate = self.estimate_from_two_faces(target_detections)
-
-        if estimate is None and self.mode in ["auto", "silhouette"]:
-            largest = max(target_detections, key=lambda x: x["area"])
-            estimate = self.estimate_from_silhouette(largest)
-
-        if estimate is None:
+        if len(estimates) == 0:
             self.publish_debug(debug, msg.header)
             return
 
-        self.draw_debug(debug, detections, estimate)
-        self.publish_pose2d(estimate)
-        self.publish_grasp_pose3d(estimate, msg.header)
+        # Backward compat: 기존 single-cup 토픽은 first cup (cup_id=0) 으로 publish.
+        # 새 consumer 는 cups_pose2d / cups_grasp_poses 를 사용.
+        primary = estimates[0]
+        self.publish_pose2d(primary)
+        self.publish_grasp_pose3d(primary, msg.header)
+
+        # Multi-cup 토픽
+        self.publish_cups_pose2d(estimates)
+        self.publish_cups_grasp_poses(estimates, msg.header)
+
+        self.draw_debug(debug, detections, estimates)
         self.publish_debug(debug, msg.header)
 
         elapsed = time.time() - start_time
+        methods = ",".join(e["method"] for e in estimates)
+        yaws = ",".join(f"{math.degrees(e['yaw']):.0f}" for e in estimates)
         self.get_logger().info(
-            f"method={estimate['method']}, "
-            f"yaw={math.degrees(estimate['yaw']):.1f} deg, "
-            f"grip=({estimate['grip_point'][0]:.1f}, {estimate['grip_point'][1]:.1f}), "
+            f"cups={len(estimates)} methods=[{methods}] yaws_deg=[{yaws}] "
             f"time={elapsed * 1000.0:.1f} ms"
         )
 
@@ -747,6 +819,92 @@ class FallenCupPoseNode(Node):
         ]
 
         self.pose2d_pub.publish(msg)
+
+    # -- Multi-cup publish (Phase 1) ---------------------------------
+    # 두 토픽이 같은 cup 집합 / 같은 순서로 publish 됨 → consumer 는 index 로 매칭.
+    # cups_pose2d:
+    #   Float32MultiArray, layout dim [{label:"cup", size:N, stride:N*13},
+    #                                  {label:"field", size:13, stride:13}]
+    #   row 마다 13 fields:
+    #     [cup_id, top_x_px, top_y_px, bot_x_px, bot_y_px,
+    #      dir_x, dir_y, yaw_rad, grip_x_px, grip_y_px,
+    #      conf, top_w_px, bot_w_px]
+    # cups_grasp_poses:
+    #   PoseArray. header 는 image header.
+    #   각 Pose: position = camera optical frame 3D grip point. orientation = image yaw.
+    #   depth 가 없는 cup 은 position 을 NaN 으로 채워 publish (index 동기 유지).
+    def publish_cups_pose2d(self, estimates):
+        if len(estimates) == 0:
+            return
+        msg = Float32MultiArray()
+        cup_dim = MultiArrayDimension()
+        cup_dim.label = "cup"
+        cup_dim.size = len(estimates)
+        cup_dim.stride = len(estimates) * 13
+        field_dim = MultiArrayDimension()
+        field_dim.label = "field"
+        field_dim.size = 13
+        field_dim.stride = 13
+        msg.layout.dim.append(cup_dim)
+        msg.layout.dim.append(field_dim)
+        data = []
+        for est in estimates:
+            top = est["top_center"]
+            bot = est["bottom_center"]
+            d = est["direction"]
+            grip = est["grip_point"]
+            data.extend([
+                float(est["cup_id"]),
+                float(top[0]), float(top[1]),
+                float(bot[0]), float(bot[1]),
+                float(d[0]), float(d[1]),
+                float(est["yaw"]),
+                float(grip[0]), float(grip[1]),
+                float(est["confidence"]),
+                float(est["top_width_px"]),
+                float(est["bottom_width_px"]),
+            ])
+        msg.data = data
+        self.cups_pose2d_pub.publish(msg)
+
+    def publish_cups_grasp_poses(self, estimates, header):
+        if not self.use_depth or len(estimates) == 0:
+            return
+        msg = PoseArray()
+        msg.header = header
+        nan = float("nan")
+        for est in estimates:
+            grip = est["grip_point"]
+            z = self.get_depth_at_pixel(grip[0], grip[1], window=7)
+            pose = Pose()
+            if z is None:
+                # depth 없는 cup: NaN 으로 표시. consumer 는 isnan 체크로 필터.
+                pose.position.x = nan
+                pose.position.y = nan
+                pose.position.z = nan
+                pose.orientation.x = 0.0
+                pose.orientation.y = 0.0
+                pose.orientation.z = 0.0
+                pose.orientation.w = 1.0
+            else:
+                point_3d = self.deproject_pixel_to_3d(grip[0], grip[1], z)
+                if point_3d is None:
+                    pose.position.x = nan
+                    pose.position.y = nan
+                    pose.position.z = nan
+                    pose.orientation.w = 1.0
+                else:
+                    x, y, zz = point_3d
+                    pose.position.x = float(x)
+                    pose.position.y = float(y)
+                    pose.position.z = float(zz)
+                    yaw = float(est["yaw"])
+                    pose.orientation.x = 0.0
+                    pose.orientation.y = 0.0
+                    pose.orientation.z = math.sin(yaw * 0.5)
+                    pose.orientation.w = math.cos(yaw * 0.5)
+            msg.poses.append(pose)
+        self.cups_grasp_poses_pub.publish(msg)
 
     def publish_grasp_pose3d(self, estimate, header):
         if not self.use_depth:
@@ -803,64 +961,73 @@ class FallenCupPoseNode(Node):
             color = (0, 255, 255) if is_target else (80, 80, 80)
             cv2.drawContours(image, [det["contour"]], -1, color, 1)
 
-    def draw_debug(self, image, detections, estimate):
+    # cup_id 별 distinguishable BGR 색 팔레트 (debug 표시용).
+    _CUP_COLORS = [
+        (0, 255, 0),     # green
+        (0, 200, 255),   # orange
+        (255, 100, 0),   # blue
+        (255, 0, 255),   # magenta
+        (0, 255, 255),   # yellow
+        (255, 255, 0),   # cyan
+    ]
+
+    def _cup_color(self, cup_id):
+        return self._CUP_COLORS[cup_id % len(self._CUP_COLORS)]
+
+    def draw_debug(self, image, detections, estimates):
+        """estimates: cup 별 estimate 리스트. cup_id 마다 다른 색 + 번호 표시."""
         for det in detections:
             cv2.drawContours(image, [det["contour"]], -1, (80, 80, 80), 1)
 
-        top = estimate["top_center"]
-        bottom = estimate["bottom_center"]
-        grip = estimate["grip_point"]
-        direction = estimate["direction"]
+        for est in estimates:
+            cup_id = int(est.get("cup_id", 0))
+            color = self._cup_color(cup_id)
 
-        top_i = tuple(np.round(top).astype(int))
-        bottom_i = tuple(np.round(bottom).astype(int))
-        grip_i = tuple(np.round(grip).astype(int))
+            top = est["top_center"]
+            bottom = est["bottom_center"]
+            grip = est["grip_point"]
+            direction = est["direction"]
 
-        arrow_end = grip + direction * 80.0
-        arrow_i = tuple(np.round(arrow_end).astype(int))
+            top_i = tuple(np.round(top).astype(int))
+            bottom_i = tuple(np.round(bottom).astype(int))
+            grip_i = tuple(np.round(grip).astype(int))
 
-        cv2.circle(image, top_i, 6, (0, 255, 255), -1)
-        cv2.circle(image, bottom_i, 6, (0, 0, 255), -1)
-        cv2.circle(image, grip_i, 7, (0, 255, 0), -1)
+            arrow_end = grip + direction * 60.0
+            arrow_i = tuple(np.round(arrow_end).astype(int))
 
-        cv2.line(image, top_i, bottom_i, (255, 0, 0), 2)
-        cv2.arrowedLine(image, top_i, arrow_i, (0, 255, 0), 3, tipLength=0.25)
+            cv2.circle(image, top_i, 5, (0, 255, 255), -1)
+            cv2.circle(image, bottom_i, 5, (0, 0, 255), -1)
+            cv2.circle(image, grip_i, 6, color, -1)
 
+            cv2.line(image, top_i, bottom_i, (255, 0, 0), 2)
+            cv2.arrowedLine(image, top_i, arrow_i, color, 2, tipLength=0.25)
+
+            # cup_id 라벨 (grip 점 옆 큰 글씨)
+            cv2.putText(
+                image,
+                f"#{cup_id}",
+                (grip_i[0] + 10, grip_i[1] + 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                color,
+                2,
+            )
+            # method + yaw (작은 글씨)
+            yaw_deg = math.degrees(float(est["yaw"]))
+            cv2.putText(
+                image,
+                f"{est['method']} {yaw_deg:+.0f}d",
+                (grip_i[0] + 10, grip_i[1] + 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+            )
+
+        # 헤더: 감지된 cup 수
         cv2.putText(
             image,
-            "TOP",
-            (top_i[0] + 8, top_i[1] - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
-
-        cv2.putText(
-            image,
-            "BOTTOM",
-            (bottom_i[0] + 8, bottom_i[1] - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255),
-            2,
-        )
-
-        cv2.putText(
-            image,
-            "GRIP",
-            (grip_i[0] + 8, grip_i[1] - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
-
-        yaw_deg = math.degrees(float(estimate["yaw"]))
-
-        cv2.putText(
-            image,
-            f"method={estimate['method']} yaw={yaw_deg:.1f} deg",
+            f"cups={len(estimates)}",
             (20, 35),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
