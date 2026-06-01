@@ -15,6 +15,8 @@ YOLOv26-seg가 카메라 영상에서 `fallen-cup` / `upright-cup` 두 클래스
 ### `speed_stack_yolo_seg` (인식 측)
 - `/camera/color/image_raw`, `/camera/aligned_depth_to_color/image_raw` 구독
 - 학습 클래스: `fallen-cup`, `upright-cup`
+- [학습 코드 참고](https://github.com/2026-yarr-robotics/vision-YOLO/tree/main/hand-eye-view)
+
 - 출력 토픽
   - `/fallen_cup/pose2d` (`std_msgs/Float32MultiArray`) — top/bottom 픽셀, 방향벡터, yaw, grip 픽셀, conf, 폭
   - `/fallen_cup/grasp_pose` (`geometry_msgs/PoseStamped`, camera optical frame) — 3D grasp point
