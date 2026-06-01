@@ -97,6 +97,48 @@ ros2 launch dsr_practice stand_fallen_cup.launch.py mode:=drop
 - `mode` — `auto` | `silhouette` | `two_face`
 - `use_depth` — true일 때만 3D grasp_pose publish
 
+## 카메라 캘리브레이션 (Hand-Eye)
+
+`stand_fallen_cup` 가 카메라 좌표계의 grasp_pose 를 로봇 base 좌표계로 변환할 때 쓰는
+**그리퍼-카메라 변환행렬** `T_gripper2camera` 를 직접 측정하기 위한 절차. 코드는
+[`Calibration_Tutorial/`](Calibration_Tutorial) 에 있습니다.
+
+**필요 자재**
+- 7×5 내부 코너 체커보드 (정사각형 한 변 25 mm).
+- Doosan bringup + RealSense 가 같은 머신에서 떠 있어야 함.
+
+**1) 데이터 수집** — `data_recording.py`
+티치펜던트로 다양한 자세 (≥15개 권장) 를 잡고 각 자세에서 실행. 매 호출마다 현재
+robot pose + RealSense 컬러 이미지를 `data/` 에 함께 저장.
+```bash
+cd Calibration_Tutorial
+python3 data_recording.py
+```
+
+**2) 캘리브 계산** — 카메라 마운팅 방식에 따라 둘 중 하나
+- **eye-in-hand** (카메라가 그리퍼/링크에 장착 — 본 프로젝트 기본): `handeye_calibration.py`
+- **eye-to-hand** (카메라가 작업공간 고정): `eye2hand_calibration.py`
+```bash
+python3 handeye_calibration.py   # 또는 eye2hand_calibration.py
+```
+실행 결과로 `T_gripper2camera.npy` (4×4, mm 단위) 가 생성됨.
+
+**3) 검증** — `test.py`
+캘리브 결과로 카메라 좌표 → base 좌표 역변환을 수행, 알려진 마커/물체 위치와 비교.
+```bash
+python3 test.py
+```
+
+**4) 적용**
+검증 통과 시 `T_gripper2camera.npy` 를 `dsr_practice/config/` 로 복사. `stand_fallen_cup`
+런치 시 자동으로 로드.
+```bash
+cp T_gripper2camera.npy ../dsr_practice/dsr_practice/config/T_gripper2camera.npy
+```
+
+> 본 리포지토리에 포함된 `T_gripper2camera.npy` 는 본 저자 셋업의 결과. 카메라 마운팅
+> 위치/각도가 다르면 동작이 어긋나므로 **본인 로봇에서 재캘리브 권장**.
+
 ## 자산 및 캘리브레이션 참고사항
 
 - **`dsr_practice/config/T_gripper2camera.npy`**
