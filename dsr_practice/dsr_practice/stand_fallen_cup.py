@@ -1082,6 +1082,16 @@ class StandFallenCupNode(Node):
             f"[lift] 자세 유지 수직 상승 (LIN, XY 고정·no-clamp) "
             f"z {start_z:.3f}→{target_z:.3f} @ XY=({cur_x:+.3f},{cur_y:+.3f})"
         )
+        # 1) 먼저 한 번의 연속 LIN 으로 target_z 까지 — 끊김 없이 매끄럽게 상승.
+        full_pose = make_pose(cur_x, cur_y, target_z, cur_ori)
+        if plan_and_execute(self.robot, self.arm, log,
+                            pose_goal=full_pose,
+                            params=self.lin_params, clamp=False):
+            log.info(f"[lift] 단일 LIN 성공 → z={target_z:.3f}")
+            return target_z
+        # 2) 단일 LIN 실패(특이점 가로지름 등) 시에만 짧은 step 으로 fallback.
+        #    계단식이라 끊기지만, 부분 상승이라도 컵/테이블 회피에 유효.
+        log.warn("[lift] 단일 LIN 실패 — 짧은 step fallback (계단식)")
         step = RETREAT_LIFT_STEP_M
         reached = start_z
         n_steps = max(1, int(math.ceil((target_z - start_z) / step)))
