@@ -57,6 +57,7 @@ def generate_launch_description():
     sim_cup_z = LaunchConfiguration("sim_cup_z")
     sim_cup_yaw_deg = LaunchConfiguration("sim_cup_yaw_deg")
     robot_namespace = LaunchConfiguration("robot_namespace")
+    joint_state_topic = LaunchConfiguration("joint_state_topic")
 
     return LaunchDescription(
         [
@@ -210,6 +211,15 @@ def generate_launch_description():
                             "bringup_real_31.sh(dsr_bringup2, name=dsr01)와 정합되도록 "
                             "기본 'dsr01'. 루트 네임스페이스 bringup이면 :=\"\" 로 비운다.",
             ),
+            DeclareLaunchArgument(
+                "joint_state_topic",
+                default_value="/dsr01/joint_states",
+                description="MoveItPy planning scene monitor가 구독할 joint state "
+                            "토픽. moveit_py.yaml의 절대 토픽 '/joint_states'는 "
+                            "name_space remap으로 바뀌지 않으므로 직접 override 한다. "
+                            "네임스페이스 bringup이면 /<ns>/joint_states (기본 "
+                            "/dsr01/joint_states). 루트 bringup이면 :=/joint_states.",
+            ),
             Node(
                 package="dsr_practice",
                 executable="stand_fallen_cup",
@@ -277,6 +287,14 @@ def generate_launch_description():
                         ),
                         "robot_namespace": ParameterValue(
                             robot_namespace, value_type=str
+                        ),
+                        # moveit_py.yaml의 절대경로 joint_state_topic을 override.
+                        # parameters 리스트에서 yaml(moveit_py_params)보다 뒤에
+                        # 오므로 우선 적용된다. 네임스페이스 bringup에서
+                        # planning_scene_monitor가 /<ns>/joint_states 를 구독해야
+                        # 현재 관절을 읽어 plan/IK 가 된다.
+                        "planning_scene_monitor_options.joint_state_topic": (
+                            ParameterValue(joint_state_topic, value_type=str)
                         ),
                     },
                 ],
