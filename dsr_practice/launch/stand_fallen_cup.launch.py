@@ -123,11 +123,12 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "place_plus_y_auto_swing",
-                default_value="false",
+                default_value="true",
                 description="place 모드: cup wide가 +Y 영역으로 누운 케이스를 자동 감지 "
                             "(sin(cup_yaw) > 0.5) 하여 swing strategy 적용. "
                             "감지 시 side/base_yaw/cup_tilt를 plus_y_* 값으로 일괄 override. "
-                            "false(기본)면 미사용. true 하나로 ±Y 양쪽 케이스 한 명령에 처리.",
+                            "true(기본)면 항상 켜짐 — +Y 미감지 시 no-op이라 다른 컵엔 영향 없음. "
+                            "끄려면 :=false. 한 명령으로 ±Y 양쪽 케이스 처리.",
             ),
             DeclareLaunchArgument(
                 "place_plus_y_side",

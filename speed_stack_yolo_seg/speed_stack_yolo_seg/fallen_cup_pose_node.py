@@ -165,6 +165,16 @@ class FallenCupPoseNode(Node):
         # 1.3 정도로 자르면 cross-cup pairing 을 막을 수 있다.
         self.declare_parameter("min_pair_diameter_ratio", 1.3)
 
+        # 축 길이 sanity 필터.
+        # 넘어진 컵의 top→bottom 축 실제 길이는 거의 일정하다. 잘못된 mask
+        # (두 컵 병합 / cross-cup pairing)는 축이 비정상적으로 길어지므로,
+        # depth로 축 양 끝을 3D deproject해서 실제 길이(m)를 재고 정상 밴드
+        # [expected ± tol] 밖이면 그 estimate를 거부한다(미터라 카메라 거리 불변).
+        # depth가 없으면 길이를 못 재므로 필터를 통과시킨다(경고 로그).
+        self.declare_parameter("enable_axis_length_filter", True)
+        self.declare_parameter("expected_axis_length_m", 0.075)
+        self.declare_parameter("axis_length_tol_m", 0.02)
+
         self.weights_path = str(self.get_parameter("weights_path").value)
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.depth_topic = str(self.get_parameter("depth_topic").value)
@@ -197,6 +207,15 @@ class FallenCupPoseNode(Node):
         self.max_pair_distance_px = float(self.get_parameter("max_pair_distance_px").value)
         self.min_pair_diameter_ratio = float(
             self.get_parameter("min_pair_diameter_ratio").value
+        )
+        self.enable_axis_length_filter = as_bool(
+            self.get_parameter("enable_axis_length_filter").value
+        )
+        self.expected_axis_length_m = float(
+            self.get_parameter("expected_axis_length_m").value
+        )
+        self.axis_length_tol_m = float(
+            self.get_parameter("axis_length_tol_m").value
         )
 
         if self.weights_path == "":
@@ -335,6 +354,25 @@ class FallenCupPoseNode(Node):
         y = (v - self.cy) * z / self.fy
 
         return x, y, z
+
+    def compute_axis_length_m(self, top_center, bottom_center):
+        """top→bottom 축의 실제 길이(m). depth/intrinsics 없으면 None.
+
+        축 양 끝 픽셀을 각자의 depth로 3D(camera optical frame) deproject 한 뒤
+        유클리드 거리를 잰다. 미터 단위라 카메라-컵 거리가 변해도 일정하고,
+        두 컵을 잇는 잘못된 축은 정상 대비 크게 길어져 쉽게 구분된다.
+        """
+        if not self.use_depth or self.fx is None or self.fy is None:
+            return None
+        z_t = self.get_depth_at_pixel(top_center[0], top_center[1], window=7)
+        z_b = self.get_depth_at_pixel(bottom_center[0], bottom_center[1], window=7)
+        if z_t is None or z_b is None:
+            return None
+        p_t = self.deproject_pixel_to_3d(top_center[0], top_center[1], z_t)
+        p_b = self.deproject_pixel_to_3d(bottom_center[0], bottom_center[1], z_b)
+        if p_t is None or p_b is None:
+            return None
+        return float(np.linalg.norm(np.asarray(p_b) - np.asarray(p_t)))
 
     # -----------------------------
     # YOLO mask extraction
@@ -518,6 +556,8 @@ class FallenCupPoseNode(Node):
             "top_width_px": top_width_px,
             "bottom_width_px": bottom_width_px,
             "confidence": 0.5 * (top["conf"] + bottom["conf"]),
+            "axis_length_m": self.compute_axis_length_m(top_center, bottom_center),
+            "axis_length_px": float(norm),
         }
 
     # -----------------------------
@@ -569,6 +609,41 @@ class FallenCupPoseNode(Node):
             est["cup_id"] = idx
 
         return estimates
+
+    def split_by_axis_length(self, estimates):
+        """축 실제 길이 기준으로 (정상, 거부) 로 분리.
+
+        - 필터 off 면 전부 정상으로 통과.
+        - axis_length_m 가 None(depth 없음) 이면 거를 수 없으므로 통과(경고 1회).
+        - 정상 밴드 [expected ± tol] 밖이면 거부(로그). 거부분은 debug 표시용 반환.
+        """
+        if not self.enable_axis_length_filter:
+            return list(estimates), []
+
+        lo = self.expected_axis_length_m - self.axis_length_tol_m
+        hi = self.expected_axis_length_m + self.axis_length_tol_m
+        kept, rejected = [], []
+        warned_no_depth = False
+        for est in estimates:
+            L = est.get("axis_length_m")
+            if L is None:
+                if not warned_no_depth:
+                    self.get_logger().warn(
+                        "axis length(m) 계산 불가(depth 없음) — length filter 스킵"
+                    )
+                    warned_no_depth = True
+                kept.append(est)
+                continue
+            if lo <= L <= hi:
+                kept.append(est)
+            else:
+                rejected.append(est)
+                self.get_logger().info(
+                    f"[len-filter] reject cup: axis={L * 100.0:.1f}cm "
+                    f"(기대 {self.expected_axis_length_m * 100.0:.1f}"
+                    f"±{self.axis_length_tol_m * 100.0:.1f}cm)"
+                )
+        return kept, rejected
 
     # -----------------------------
     # Method 2: one full silhouette mask
@@ -681,6 +756,8 @@ class FallenCupPoseNode(Node):
             "top_width_px": float(top_width_px),
             "bottom_width_px": float(bottom_width_px),
             "confidence": float(detection["conf"]),
+            "axis_length_m": self.compute_axis_length_m(top_center, bottom_center),
+            "axis_length_px": float(axis_norm),
         }
 
     def cross_section_center(self, center, pts_centered, proj, perp, v, n, target_t, band):
@@ -780,7 +857,15 @@ class FallenCupPoseNode(Node):
         # 빈 리스트면 (estimate 실패) early return.
         estimates = self.estimate_all_cups(target_detections)
 
+        # 축 길이 sanity 필터: 잘못된 mask(두 컵 병합 / cross-cup pairing)는 축이
+        # 비정상적으로 길어짐 → 정상 길이 밴드 밖이면 거부. 거부분은 debug 에 빨간색.
+        estimates, rejected = self.split_by_axis_length(estimates)
+        for idx, est in enumerate(estimates):
+            est["cup_id"] = idx
+
         if len(estimates) == 0:
+            # 전부 거부돼도 rejected 를 그려 왜 걸러졌는지 보이게 한다.
+            self.draw_debug(debug, detections, [], rejected)
             self.publish_debug(debug, msg.header)
             return
 
@@ -794,14 +879,20 @@ class FallenCupPoseNode(Node):
         self.publish_cups_pose2d(estimates)
         self.publish_cups_grasp_poses(estimates, msg.header)
 
-        self.draw_debug(debug, detections, estimates)
+        self.draw_debug(debug, detections, estimates, rejected)
         self.publish_debug(debug, msg.header)
 
         elapsed = time.time() - start_time
         methods = ",".join(e["method"] for e in estimates)
         yaws = ",".join(f"{math.degrees(e['yaw']):.0f}" for e in estimates)
+        lens = ",".join(
+            f"{e['axis_length_m'] * 100.0:.1f}"
+            if e.get("axis_length_m") is not None else "NA"
+            for e in estimates
+        )
         self.get_logger().info(
-            f"cups={len(estimates)} methods=[{methods}] yaws_deg=[{yaws}] "
+            f"cups={len(estimates)} rej={len(rejected)} methods=[{methods}] "
+            f"yaws_deg=[{yaws}] axis_cm=[{lens}] "
             f"time={elapsed * 1000.0:.1f} ms"
         )
 
@@ -986,10 +1077,29 @@ class FallenCupPoseNode(Node):
     def _cup_color(self, cup_id):
         return self._CUP_COLORS[cup_id % len(self._CUP_COLORS)]
 
-    def draw_debug(self, image, detections, estimates):
-        """estimates: cup 별 estimate 리스트. cup_id 마다 다른 색 + 번호 표시."""
+    def draw_debug(self, image, detections, estimates, rejected=None):
+        """estimates: cup 별 estimate 리스트. cup_id 마다 다른 색 + 번호 표시.
+
+        rejected: 축 길이 필터에 걸린 estimate 리스트. 빨간 선 + 길이 라벨로 표시해
+        튜닝 시 어떤 벡터가 왜 걸러졌는지 눈으로 확인 가능.
+        """
         for det in detections:
             cv2.drawContours(image, [det["contour"]], -1, (80, 80, 80), 1)
+
+        for est in (rejected or []):
+            top_i = tuple(np.round(est["top_center"]).astype(int))
+            bottom_i = tuple(np.round(est["bottom_center"]).astype(int))
+            cv2.line(image, top_i, bottom_i, (0, 0, 255), 2)  # red
+            L = est.get("axis_length_m")
+            label = f"REJECT {L * 100.0:.0f}cm" if L is not None else "REJECT"
+            mid = (
+                (top_i[0] + bottom_i[0]) // 2,
+                (top_i[1] + bottom_i[1]) // 2,
+            )
+            cv2.putText(
+                image, label, (mid[0] + 8, mid[1]),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1,
+            )
 
         for est in estimates:
             cup_id = int(est.get("cup_id", 0))
@@ -1036,10 +1146,13 @@ class FallenCupPoseNode(Node):
                 1,
             )
 
-        # 헤더: 감지된 cup 수
+        # 헤더: 감지된 cup 수 (+ 길이 필터에 걸린 수)
+        header = f"cups={len(estimates)}"
+        if rejected:
+            header += f" rej={len(rejected)}"
         cv2.putText(
             image,
-            f"cups={len(estimates)}",
+            header,
             (20, 35),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,

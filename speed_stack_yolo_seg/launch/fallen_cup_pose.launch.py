@@ -89,6 +89,26 @@ def generate_launch_description():
                 "cross-cup pairing 을 차단한다. 너무 키우면 valid 한 two_face 도 거부됨."
             ),
         ),
+        DeclareLaunchArgument(
+            "enable_axis_length_filter",
+            default_value="true",
+            description=(
+                "축 길이 sanity 필터 on/off. 넘어진 컵 top→bottom 축 실제 길이는 "
+                "거의 일정 → 정상 밴드 밖(두 컵 병합/cross-cup)이면 거부. "
+                "튜닝 전엔 false 로 두고 로그의 axis_cm 측정 후 켜는 것을 권장."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "expected_axis_length_m",
+            default_value="0.075",
+            description="정상 넘어진 컵의 top→bottom 축 실제 길이(m). 측정값 7.5cm "
+                        "(silhouette 단일 컵, 2026-06-08). 로그 axis_cm 으로 재측정해 보정 가능.",
+        ),
+        DeclareLaunchArgument(
+            "axis_length_tol_m",
+            default_value="0.02",
+            description="허용 오차(±m). expected±tol 밖이면 거부. 기본 0.02=±2cm.",
+        ),
 
         Node(
             package="speed_stack_yolo_seg",
@@ -123,6 +143,10 @@ def generate_launch_description():
                 "min_pair_distance_px": 20.0,
                 "max_pair_distance_px": 10000.0,
                 "min_pair_diameter_ratio": LaunchConfiguration("min_pair_diameter_ratio"),
+
+                "enable_axis_length_filter": LaunchConfiguration("enable_axis_length_filter"),
+                "expected_axis_length_m": LaunchConfiguration("expected_axis_length_m"),
+                "axis_length_tol_m": LaunchConfiguration("axis_length_tol_m"),
             }],
         ),
     ])

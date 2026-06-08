@@ -80,6 +80,14 @@ GRIP_Z_MARGIN   = 0.020  # 그립 지점에서 위로 띄울 마진 (m). 5mm →
                          # 그리퍼가 컵을 누르며 트립되는 것 방지.
 LIFT_Z          = 0.45   # 들어 올리는 최종 z (절대값, flange 기준)
 LIFT_HOLD_SEC   = 1.0    # 들어 올린 채 매달림 안정화 대기 시간 (s)
+HOME_RETURN_HIGH_Z = 0.30  # HOME 복귀 시 EE z 가 이 값보다 높으면 테이블 dip 위험이
+                           # 없다고 보고 Pilz PTP(결정적·최단) 를 먼저 시도. retreat 후
+                           # (z≈LIFT_Z) 복귀가 이 경로를 타서 OMPL 의 빙 도는 궤적을 회피.
+RETREAT_LIFT_STEP_M = 0.06 # place 후 수직 상승 LIN 의 step 크기 (m). 짧을수록 특이점을
+                           # 가로지를 확률↓(LIN 성공률↑) 이지만 step 수↑(느려짐).
+HOME_PREREVERSE_MIN_Z = 0.25  # joint_1 pre-reverse(수평 호) 를 허용하는 최소 EE z.
+                           # 이보다 낮으면 joint_1 회전이 테이블을 쓸어버리므로,
+                           # 먼저 수직 상승을 시도하고 그래도 낮으면 pre-reverse 를 스킵.
 
 # 컵 놓기 (drop / place 모드 공용)
 PLACE_X       = 0.55     # 컵을 세울 위치 (base frame, m).
@@ -171,17 +179,18 @@ def clamp_to_safe_workspace(x, y, z, logger):
 
 
 def plan_and_execute(robot, arm, logger, pose_goal=None,
-                     state_goal=None, params=None):
+                     state_goal=None, params=None, clamp=True):
     arm.set_start_state_to_current_state()
 
     if pose_goal is not None:
-        x = pose_goal.pose.position.x
-        y = pose_goal.pose.position.y
-        z = pose_goal.pose.position.z
-        sx, sy, sz = clamp_to_safe_workspace(x, y, z, logger)
-        pose_goal.pose.position.x = sx
-        pose_goal.pose.position.y = sy
-        pose_goal.pose.position.z = sz
+        if clamp:
+            x = pose_goal.pose.position.x
+            y = pose_goal.pose.position.y
+            z = pose_goal.pose.position.z
+            sx, sy, sz = clamp_to_safe_workspace(x, y, z, logger)
+            pose_goal.pose.position.x = sx
+            pose_goal.pose.position.y = sy
+            pose_goal.pose.position.z = sz
         arm.set_goal_state(pose_stamped_msg=pose_goal, pose_link=EE_LINK)
     elif state_goal is not None:
         arm.set_goal_state(robot_state=state_goal)
@@ -359,7 +368,7 @@ class StandFallenCupNode(Node):
         #   - 감지 됨: side, base_yaw, tilt 가 plus_y_* 값으로 override.
         #   - 감지 안 됨: 사용자가 지정한(또는 기본) 파라미터 그대로 사용.
         #   한 명령으로 양쪽 케이스(cup wide ±Y) 모두 안전 처리하기 위함.
-        self.declare_parameter("place_plus_y_auto_swing", False)
+        self.declare_parameter("place_plus_y_auto_swing", True)
         # 아래 3개는 위 auto_swing 이 True 이고 +Y 감지된 경우에만 적용.
         # 기본값은 사용자 검증된 조합 (left / +60° / 25°).
         self.declare_parameter("place_plus_y_side", "left")
@@ -1028,26 +1037,152 @@ class StandFallenCupNode(Node):
         target_state.update()
         return target_state
 
+    # ── 수직 상승 헬퍼 ─────────────────────────────
+    def _lift_straight_up(self, target_z):
+        """현재 EE 자세(XY·orientation) 를 그대로 유지하며 z 만 target_z 까지
+        짧은 LIN step 으로 수직 상승. clamp=False 로 현재 XY 를 고정해 대각선화 방지.
+        한 step 이 실패하면 그때까지 도달한 높이에서 멈춘다(부분 상승도 컵 회피에 유효).
+        반환: 도달한 z (m).
+        """
+        log = self.get_logger()
+        cur_T = get_ee_matrix(self.robot)
+        cur_x = float(cur_T[0, 3])
+        cur_y = float(cur_T[1, 3])
+        start_z = float(cur_T[2, 3])
+        if start_z >= target_z - 1e-3:
+            return start_z
+        cqx, cqy, cqz, cqw = rotmat_to_quat_xyzw(cur_T[:3, :3])
+        cur_ori = {"x": cqx, "y": cqy, "z": cqz, "w": cqw}
+        log.info(
+            f"[lift] 자세 유지 수직 상승 (LIN, XY 고정·no-clamp) "
+            f"z {start_z:.3f}→{target_z:.3f} @ XY=({cur_x:+.3f},{cur_y:+.3f})"
+        )
+        step = RETREAT_LIFT_STEP_M
+        reached = start_z
+        n_steps = max(1, int(math.ceil((target_z - start_z) / step)))
+        for i in range(n_steps):
+            z_goal = min(target_z, start_z + step * (i + 1))
+            step_pose = make_pose(cur_x, cur_y, z_goal, cur_ori)
+            if plan_and_execute(self.robot, self.arm, log,
+                                pose_goal=step_pose,
+                                params=self.lin_params, clamp=False):
+                reached = z_goal
+            else:
+                log.warn(
+                    f"[lift] LIN step z→{z_goal:.3f} 실패 "
+                    f"(확보 높이 {reached:.3f}m, Δ={reached - start_z:.3f}m)"
+                )
+                break
+        return reached
+
     # ── 메인 ──────────────────────────────
     # ── HOME 복귀 헬퍼 (Phase 2) ─────────────────
     def _return_to_session_home(self, final=False):
-        """session HOME 으로 복귀. OMPL → Pilz PTP fallback.
+        """session HOME 으로 복귀.
+        1단계 (pre-reverse): joint_1 이 HOME 과 크게 다르면 (예: plus_y_auto_swing
+                            에 의한 +60°) joint_1 만 먼저 HOME 값으로 PTP. 다른 joint
+                            유지 → EE z 변동 없음 → 테이블 dip 위험 없음.
+        2단계 (HOME 복귀): 전체 joint 를 session HOME 으로. OMPL 먼저
+                          (collision-aware sampling), Pilz PTP fallback. PTP first 로
+                          했더니 joint-space 직선이 Cartesian dip 을 만들어 테이블 충돌
+                          궤적이 나옴 — OMPL 로 다시 두는 게 안전.
         final=True 면 그리퍼 open + 시작 자세 대비 검증 로그까지 수행.
         반환: True (성공), False (모든 시도 실패).
         """
         log = self.get_logger()
+
+        # 0단계: 안전 높이 확보 — pre-reverse(joint_1 수평 호) 전에 반드시 EE 를 띄운다.
+        # retreat 가 실패해 EE 가 낮은 채로 들어오면(예: -Y standing IK 실패), joint_1
+        # 만 회전시키는 pre-reverse 가 그리퍼를 테이블과 평행하게 쓸어버린다(작업영역
+        # 컵 타격). 낮으면 먼저 수직 상승시켜 그 sweep 을 원천 차단한다.
+        ee_z_now = float(get_ee_matrix(self.robot)[2, 3])
+        if ee_z_now < HOME_PREREVERSE_MIN_Z:
+            log.info(
+                f"[Home] EE z={ee_z_now:.3f}m < {HOME_PREREVERSE_MIN_Z:.2f}m "
+                "→ pre-reverse 전 수직 상승 (수평 sweep 방지)"
+            )
+            ee_z_now = self._lift_straight_up(LIFT_Z)
+            log.info(f"[Home] 수직 상승 결과 z={ee_z_now:.3f}m")
+
+        # 1단계: pre-reverse joint_1 (필요시, 그리고 EE 가 충분히 높을 때만)
+        # plus_y_auto_swing 등으로 joint_1 이 +60° 같은 큰 값에 가 있는 상태에서
+        # 곧장 HOME 으로 가면 6-joint 동시 보간이 Cartesian dip 을 만들어 테이블
+        # 충돌 가능. joint_1 만 먼저 HOME 값으로 돌려 두면 EE z 가 그대로 유지되고
+        # 이후 HOME 복귀는 joint 변화량이 작아져 dip risk 도 작아짐.
+        # ※ 단 EE 가 낮으면(수직 상승 실패) joint_1 회전이 곧 수평 sweep 이므로 스킵.
+        home_j1 = self._session_home_joints.get("joint_1", 0.0)
+        try:
+            current_joints = self._read_current_joints()
+            current_j1 = current_joints.get("joint_1", home_j1)
+        except Exception as exc:
+            log.warn(f"[Home] 현재 joint 읽기 실패 ({exc}) — pre-reverse 스킵")
+            current_joints = None
+
+        if current_joints is not None and ee_z_now < HOME_PREREVERSE_MIN_Z:
+            log.warn(
+                f"[Home] EE z={ee_z_now:.3f}m 여전히 낮음 → joint_1 pre-reverse 스킵 "
+                "(수평 sweep 방지). OMPL collision-aware 복귀에 위임."
+            )
+        elif current_joints is not None:
+            j1_diff_deg = math.degrees(abs(current_j1 - home_j1))
+            if j1_diff_deg > 20.0:
+                log.info(
+                    f"[Home] pre-reverse: joint_1 "
+                    f"{math.degrees(current_j1):+.1f}° → "
+                    f"{math.degrees(home_j1):+.1f}° (다른 joint 유지, EE z={ee_z_now:.3f}m)"
+                )
+                intermediate = dict(current_joints)
+                intermediate["joint_1"] = home_j1
+                inter_state = RobotState(self.robot_model)
+                inter_state.joint_positions = intermediate
+                inter_state.update()
+                inter_ok = plan_and_execute(self.robot, self.arm, log,
+                                            state_goal=inter_state,
+                                            params=self.pilz_params)
+                if not inter_ok:
+                    log.warn(
+                        "[Home] pre-reverse 실패 — 그대로 HOME 시도 (Cartesian dip "
+                        "가능성 ↑)"
+                    )
+
+        # 2단계: 전체 HOME 복귀
         home_back = RobotState(self.robot_model)
         home_back.joint_positions = self._session_home_joints
         home_back.update()
 
+        # 플래너 순서 결정 (EE 높이 기반):
+        #   - 이미 충분히 높으면(>HOME_RETURN_HIGH_Z): Pilz PTP 먼저.
+        #     OMPL(RRTConnect)은 샘플링 기반이라 가끔 빙 도는 과한 궤적을 내놓는데,
+        #     retreat(z=LIFT_Z) + pre-reverse 로 이미 떠 있으면 joint 직선보간(PTP)이
+        #     테이블 dip 없이 결정적·최단 경로로 HOME 에 간다.
+        #   - 낮은 자세에서 호출된 경우(예외): 기존대로 OMPL 먼저 (dip 회피).
+        try:
+            ee_z = float(get_ee_matrix(self.robot)[2, 3])
+        except Exception:
+            ee_z = 0.0
+        if ee_z > HOME_RETURN_HIGH_Z:
+            log.info(
+                f"[Home] EE z={ee_z:.3f}m > {HOME_RETURN_HIGH_Z:.2f}m → "
+                "Pilz PTP 우선 (결정적·최단), OMPL fallback"
+            )
+            primary, secondary = self.pilz_params, self.ompl_params
+            primary_name, secondary_name = "Pilz PTP", "OMPL"
+        else:
+            log.info(
+                f"[Home] EE z={ee_z:.3f}m ≤ {HOME_RETURN_HIGH_Z:.2f}m → "
+                "OMPL 우선 (낮은 자세 dip 회피), Pilz PTP fallback"
+            )
+            primary, secondary = self.ompl_params, self.pilz_params
+            primary_name, secondary_name = "OMPL", "Pilz PTP"
+
         home_ok = plan_and_execute(self.robot, self.arm, log,
                                    state_goal=home_back,
-                                   params=self.ompl_params)
+                                   params=primary)
         if not home_ok:
-            log.warn("[Home] OMPL HOME 복귀 실패 — Pilz PTP로 재시도")
+            log.warn(f"[Home] {primary_name} HOME 복귀 실패 — {secondary_name} 로 재시도")
             home_ok = plan_and_execute(self.robot, self.arm, log,
                                        state_goal=home_back,
-                                       params=self.pilz_params)
+                                       params=secondary)
         if not final:
             return home_ok
 
@@ -1605,20 +1740,28 @@ class StandFallenCupNode(Node):
                 log.info("[sim] cup placed (서있음)")
             time.sleep(1.0)
 
-            # (g) retreat (위로 — 그리퍼 stand orientation 유지)
-            log.info(f"[7] 후퇴 위로 @ z={LIFT_Z:.3f}")
-            retreat_pose  = make_pose(stand_fx, stand_fy, LIFT_Z, stand_ori)
-            retreat_state = self.ik_state_with_current_seed(
-                retreat_pose, timeout=2.0, seed_overrides=place_seed_overrides
-            )
-            if retreat_state is not None:
-                plan_and_execute(self.robot, self.arm, log,
-                                 state_goal=retreat_state,
-                                 params=self.pilz_params)
-            else:
-                plan_and_execute(self.robot, self.arm, log,
-                                 pose_goal=retreat_pose,
-                                 params=self.pilz_params)
+            # (g) retreat — 자세 그대로 z 만 수직 상승 (incremental Cartesian LIN).
+            # 한 번의 큰 LIN 은 -Y standing 의 기운 wrist 자세에서 특이점을 가로질러
+            # 실패하므로 짧은 step 으로 나눠 올린다. 부분 상승이라도 컵을 벗어나 안전.
+            log.info(f"[7] 후퇴: 수직 상승 → z={LIFT_Z:.3f}")
+            start_z = float(get_ee_matrix(self.robot)[2, 3])
+            reached = self._lift_straight_up(LIFT_Z)
+            if reached - start_z < 0.03:
+                # LIN 이 거의 못 올라감 — standing 자세가 특이점/한계에 가깝다는 신호.
+                # PTP IK 로 한 번 더 시도하되, 실패하면 HOME 복귀 단계가 (낮은 z 를
+                # 감지해) 다시 수직 상승 후 안전하게 복귀하므로 여기서 sweep 위험 없음.
+                log.warn(
+                    f"[7] 수직 상승 거의 실패 (Δz={reached - start_z:.3f}m) — "
+                    "PTP IK 로 재시도 (HOME 복귀에서 재상승 보장)"
+                )
+                retreat_pose  = make_pose(stand_fx, stand_fy, LIFT_Z, stand_ori)
+                retreat_state = self.ik_state_with_current_seed(
+                    retreat_pose, timeout=2.0, seed_overrides=place_seed_overrides
+                )
+                if retreat_state is not None:
+                    plan_and_execute(self.robot, self.arm, log,
+                                     state_goal=retreat_state,
+                                     params=self.pilz_params)
             log.info("=== place (방법2: pitch tilt) 완료 ===")
 
         return True
