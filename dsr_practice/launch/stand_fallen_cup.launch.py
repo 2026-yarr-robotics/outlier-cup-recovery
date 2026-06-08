@@ -20,7 +20,9 @@ def generate_launch_description():
         .joint_limits()
         .trajectory_execution()
         .planning_scene_monitor()
-        .sensors_3d()
+        # .sensors_3d() 제거: 3D 센서(sensors_3d.yaml = sensors:[]) 미구성이라
+        # octomap 모니터가 "No 3D sensor plugin(s)" ERROR 만 찍고 실제 octomap
+        # 충돌회피는 안 함. stand_fallen_cup 은 octomap 미사용 → 노이즈 로그 제거.
         .to_moveit_configs()
     )
 
