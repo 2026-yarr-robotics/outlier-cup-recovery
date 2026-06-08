@@ -56,6 +56,7 @@ def generate_launch_description():
     sim_cup_y = LaunchConfiguration("sim_cup_y")
     sim_cup_z = LaunchConfiguration("sim_cup_z")
     sim_cup_yaw_deg = LaunchConfiguration("sim_cup_yaw_deg")
+    robot_namespace = LaunchConfiguration("robot_namespace")
 
     return LaunchDescription(
         [
@@ -201,6 +202,14 @@ def generate_launch_description():
                 default_value="0.0",
                 description="sim 모드 가상 컵 yaw (deg)",
             ),
+            DeclareLaunchArgument(
+                "robot_namespace",
+                default_value="dsr01",
+                description="bringup이 네임스페이스(예: dsr01) 아래에서 도는 경우 "
+                            "MoveItPy 내부 노드들을 같은 네임스페이스로 옮기기 위한 값. "
+                            "bringup_real_31.sh(dsr_bringup2, name=dsr01)와 정합되도록 "
+                            "기본 'dsr01'. 루트 네임스페이스 bringup이면 :=\"\" 로 비운다.",
+            ),
             Node(
                 package="dsr_practice",
                 executable="stand_fallen_cup",
@@ -265,6 +274,9 @@ def generate_launch_description():
                         "sim_cup_z": ParameterValue(sim_cup_z, value_type=float),
                         "sim_cup_yaw_deg": ParameterValue(
                             sim_cup_yaw_deg, value_type=float
+                        ),
+                        "robot_namespace": ParameterValue(
+                            robot_namespace, value_type=str
                         ),
                     },
                 ],

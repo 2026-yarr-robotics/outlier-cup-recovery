@@ -391,6 +391,17 @@ class StandFallenCupNode(Node):
         self.declare_parameter("sim_cup_y", 0.00)
         self.declare_parameter("sim_cup_z", 0.10)
         self.declare_parameter("sim_cup_yaw_deg", 0.0)
+        # robot_namespace:
+        #   bringup이 네임스페이스(예: /dsr01) 아래에서 도는 워크스페이스용.
+        #   MoveItPy는 자체 rclcpp 컨텍스트를 새로 만들기 때문에 launch의
+        #   namespace= / __ns remap이 전파되지 않는다. 값이 있으면 MoveItPy에
+        #   name_space + __ns remap을 넘겨 내부 노드들(planning_scene_monitor,
+        #   moveit_simple_controller_manager)이 모두 해당 네임스페이스 아래에서
+        #   생성되게 한다. 그래야 (1) FollowJointTrajectory 액션 클라이언트가
+        #   <ns>/dsr_moveit_controller 에 바인딩되고 (2) joint_states 구독이
+        #   <ns>/joint_states 로 걸려 현재 관절을 읽는다. 빈 값이면 루트.
+        #   기본 'dsr01': bringup_real_31.sh(dsr_bringup2, name=dsr01)와 정합.
+        self.declare_parameter("robot_namespace", "dsr01")
 
         self.dry_run = bool(self.get_parameter("dry_run").value)
         self.use_current_as_home = bool(
@@ -468,6 +479,9 @@ class StandFallenCupNode(Node):
         self.sim_cup_y = float(self.get_parameter("sim_cup_y").value)
         self.sim_cup_z = float(self.get_parameter("sim_cup_z").value)
         self.sim_cup_yaw_deg = float(self.get_parameter("sim_cup_yaw_deg").value)
+        self.robot_namespace = str(
+            self.get_parameter("robot_namespace").value or ""
+        ).strip()
 
         log.info(f"=== POST-LIFT MODE: {self.mode} ===")
         if self.sim:
@@ -501,8 +515,19 @@ class StandFallenCupNode(Node):
                 raise
 
         # MoveIt
+        # MoveItPy는 rclcpp::init(...)로 자체 컨텍스트를 만들고 launch가 넘긴
+        # --ros-args(__ns 포함)를 무시한다. robot_namespace가 지정되면
+        # name_space + __ns remap을 직접 넘겨 내부 노드들이 해당 네임스페이스
+        # 아래에서 생성되게 한다 → FollowJointTrajectory 클라이언트가
+        # <ns>/dsr_moveit_controller 에, joint_states 구독이 <ns>/joint_states 에 바인딩.
         log.info("MoveItPy 초기화 중…")
-        self.robot = MoveItPy(node_name="stand_fallen_cup_moveit_py")
+        ns = self.robot_namespace
+        moveit_kwargs = {"node_name": "stand_fallen_cup_moveit_py"}
+        if ns and ns != "/":
+            moveit_kwargs["name_space"] = ns
+            moveit_kwargs["remappings"] = {"__ns": ns}
+            log.info(f"MoveItPy namespace: {ns}")
+        self.robot = MoveItPy(**moveit_kwargs)
         self.arm = self.robot.get_planning_component(GROUP_NAME)
         self.robot_model = self.robot.get_robot_model()
         log.info("MoveItPy 초기화 완료")
