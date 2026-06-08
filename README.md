@@ -51,7 +51,8 @@ cd ~/ros2_ws/src
 git clone https://github.com/2026-yarr-robotics/fallen-cup-recovery.git
 
 # Doosan 공식 패키지 (같은 src/ 아래)
-git clone https://github.com/doosan-robotics/doosan-robot2.git
+# 동작 검증 버전: humble 브랜치, release 20260324 (commit ec92425)
+git clone -b humble https://github.com/doosan-robotics/doosan-robot2.git
 
 cd ~/ros2_ws
 colcon build --symlink-install
@@ -64,8 +65,12 @@ source install/setup.bash
 
 **1) Doosan bringup + MoveIt**
 ```bash
-ros2 launch dsr_bringup2 dsr_bringup2_moveit.launch.py
+# 실기(real) — host 는 로봇 컨트롤러 IP 로 교체
+ros2 launch dsr_bringup2 dsr_bringup2_moveit.launch.py \
+    mode:=real model:=m0609 host:=192.168.1.100
 ```
+> `dsr_bringup2` 등 bringup 패키지는 두산 공식 코드(위 clone)를 **수정 없이** 그대로 사용합니다.
+> 본 리포지토리에는 로봇 제어 로직(`dsr_practice/stand_fallen_cup`)만 포함됩니다.
 
 **2) RealSense + YOLO 인식 노드**
 ```bash
