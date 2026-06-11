@@ -30,6 +30,9 @@ YOLOv26-seg가 카메라 영상에서 `fallen-cup` / `upright-cup` 두 클래스
 - `stand_fallen_cup` 노드: 위 토픽 구독 → MoveIt + RG2로 컵 머리 옆을 잡고 들어 올린 뒤
   - `mode:=drop` — 그 자리에서 컵 떨어뜨림
   - `mode:=place` — 손목 pitch 회전으로 세워서 작업공간 다른 위치에 내려놓음
+- `multi_cup:=true` — 한 프레임에 여러 fallen cup 이 있으면 가까운 순서로 순차 처리
+- `pyramid_avoid:=true` (기본 ON) — 쌓인 컵 피라미드를 MoveIt collision object 로 등록해
+  recovery 궤적이 그 영역을 회피. ([아래 참고](#피라미드-영역-회피-place-모드))
 
 ## 외부 의존성 (별도 설치 필요)
 
@@ -87,7 +90,40 @@ ros2 launch speed_stack_yolo_seg fallen_cup_pose.launch.py \
 ```bash
 ros2 launch dsr_practice stand_fallen_cup.launch.py mode:=drop
 # 또는 mode:=place
+
+# 멀티컵 + 피라미드 회피까지 한 번에 (place 모드)
+ros2 launch dsr_practice stand_fallen_cup.launch.py \
+    mode:=place multi_cup:=true pyramid_avoid:=true \
+    pyramid_config_url:=<피라미드 config GET 엔드포인트>
 ```
+> `pyramid_avoid` / `place_plus_y_auto_swing` 은 기본 ON 이라 생략해도 됩니다.
+> 피라미드 회피는 `/stack` 점유 슬롯 + `pyramid_config_url` 응답이 모두 있을 때만 실제로
+> 동작하며, 없으면 graceful no-op 입니다. ([피라미드 영역 회피](#피라미드-영역-회피-place-모드))
+
+## 피라미드 영역 회피 (place 모드)
+
+`place` 모드로 세운 컵을 작업공간에 내려놓을 때, 옆에 **이미 쌓여 있는 컵 피라미드**를
+건드리지 않도록 회피합니다.
+
+- **장애물 등록**: 피라미드 점유 슬롯(`/stack` 토픽의 occupied slot)을 MoveIt
+  `CollisionObject` 로 등록. 피라미드 center/degree 는 `pyramid_config_url` API polling
+  으로 동기화하여 실제 물리 위치와 일치시킵니다. MoveIt 이 이 충돌체를 피하는 궤적만
+  계획하므로, 회피 불가 시엔 실패-안전(plan fail)으로 빠집니다.
+- **활성 조건**: `pyramid_avoid:=true`(기본) + `/stack` 점유 슬롯 + `pyramid_config_url`
+  GET 응답, **셋 다** 있어야 실제 회피가 동작합니다. vision 스택/서버가 미가용이거나
+  점유 슬롯이 없으면 **graceful no-op**(장애물 0개, 기존 동작과 동일)으로 떨어집니다.
+
+### place 위치 / ±Y auto-swing
+
+세운 컵은 피라미드에서 멀고 base_link 와 가까운 +Y 작업영역(`PLACE = (0.30, 0.10)`)에
+내려놓습니다. 넘어진 컵의 누운 방향(wide 면이 +Y/-Y)에 따라 팔꿈치(link_4/5/6)가
+피라미드를 쓸지 않도록 base swing 전략을 자동 적용합니다.
+
+- `place_plus_y_auto_swing:=true` (기본 ON) — `sin(cup_yaw)` 부호로 ±Y 케이스를 자동 감지.
+  - **+Y** (wide 면이 +Y, yaw≈+90°): side=left / base_yaw=+60° / tilt=25° 로 swing → +Y 쪽에서 접근.
+  - **-Y** (wide 면이 -Y, yaw≈-90°): 대칭으로 side=right / base_yaw=-60° 로 swing.
+  - +Y 미감지(다른 컵)면 no-op 이라 항상 켜 둬도 안전. 한 명령으로 ±Y 양쪽 케이스 처리.
+- `place_x` / `place_y` — PLACE 좌표를 리빌드 없이 override(base_link, m). `nan`(기본)이면 모듈 상수 사용.
 
 ## 주요 파라미터
 
@@ -96,6 +132,12 @@ ros2 launch dsr_practice stand_fallen_cup.launch.py mode:=drop
 - `dry_run` — `true`면 approach까지만 가서 그리퍼 yaw 정렬 확인 (close/lift 없음)
 - `cup_yaw_override_deg` — NaN이 아니면 인식 yaw 무시하고 강제 값 사용
 - `sim` — HW 없이 MoveIt virtual에서 시뮬레이션
+- `multi_cup` — `true`면 한 프레임의 여러 fallen cup 을 가까운 순서로 순차 처리
+- `pyramid_avoid` — `true`(기본)면 쌓인 피라미드 영역을 collision object 로 회피
+- `pyramid_config_url` — 피라미드 center/degree 를 GET 으로 받는 API 엔드포인트 (빈 문자열이면 polling 끔)
+- `pyramid_stack_topic` — 피라미드 슬롯 점유 토픽(기본 `/stack`)
+- `place_plus_y_auto_swing` — `true`(기본)면 ±Y 누운 케이스 자동 감지 후 base swing
+- `place_x` / `place_y` — PLACE 좌표 override (base_link, m; `nan`이면 모듈 상수)
 
 `fallen_cup_pose_node`
 - `target_class_name` — 기본 `fallen-cup`. 빈 문자열이면 클래스 필터링 끔
