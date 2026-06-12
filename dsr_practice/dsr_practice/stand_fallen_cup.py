@@ -24,6 +24,7 @@ YOLO 인식 노드(fallen_cup_pose_node)가 publish하는
 
 import json
 import math
+import sys
 import threading
 import time
 import urllib.request
@@ -444,6 +445,20 @@ class StandFallenCupNode(Node):
         self.declare_parameter("multi_cup_cluster_radius_m", 0.04)
         self.declare_parameter("multi_cup_blacklist_radius_m", 0.06)
         self.declare_parameter("multi_cup_min_samples_per_cluster", 3)
+        # ── 빈 안전지점 세우기 (multi_cup 기본) ────────────────────────────
+        #   multi_cup 동작을 "제자리 세우기"가 아니라 "작업영역 빈 안전지점 세우기"로.
+        #   카메라가 보는 정상 컵(/hand_eye/boxes upright-cup) + 이미 세운 컵(blacklist)
+        #   + 피라미드를 피해 후보 좌표 중 첫 빈 자리에 세운다. 빈 자리 없으면 그 cup skip.
+        #   place_in_place:=true 면 기존 제자리 세우기로 회귀.
+        self.declare_parameter("place_in_place", False)
+        #   후보 PLACE 좌표 "x:y,x:y,..." (base_link, 1순위부터 검사). 기본 = 검증값
+        #   (0.30,0.10) + 좌우 2개. 셋 다 +Y/-Y swing flange 가 ±SAFE_Y_MAX(0.30) 내.
+        self.declare_parameter(
+            "place_spot_candidates", "0.30:0.10,0.30:0.00,0.30:-0.10")
+        #   후보를 "점유"로 볼 회피 반경(m) — upright-cup/blacklist/피라미드 공통.
+        self.declare_parameter("place_spot_avoid_radius_m", 0.09)
+        #   정상 컵 위치 토픽 (upright_cup_pose_node 발행, base_link MarkerArray).
+        self.declare_parameter("upright_boxes_topic", "/hand_eye/boxes")
         # sim: 카메라/그리퍼 하드웨어 없이 MoveIt virtual에서 동작 시각화
         self.declare_parameter("sim", False)
         self.declare_parameter("sim_cup_x", 0.28)   # 넘어진-컵 작업영역(피라미드 정면 0.45,0 에서 옆·뒤로 빠짐)
@@ -479,6 +494,17 @@ class StandFallenCupNode(Node):
         # 그리퍼 충돌 프록시 attach 여부 (실로봇/sim 공통, 기본 ON).
         # 끄면 planning 이 팔 링크만 보고 그리퍼 부피를 무시 → 피라미드 클립 위험.
         self.declare_parameter("attach_gripper_collision", True)
+
+        # ── 정상(세워진) 컵 장애물 회피 ───────────────────────────────────
+        # True 면 /hand_eye/boxes 의 정상 컵 위치마다 실린더 collision object 를
+        # 등록해 recovery 궤적이 회피. multi_cup loop 는 매 sense 직후 갱신한다.
+        # 토픽이 안 떠 있으면(정상 컵 0개) graceful no-op.
+        self.declare_parameter("avoid_upright_cups", True)
+        self.declare_parameter("upright_obstacle_radius_m", 0.04)  # 컵 반경+여유
+        self.declare_parameter("upright_obstacle_height_m", 0.12)  # 컵 높이+여유
+        # pick 전에 approach/descend IK 해가 있는지 미리 검사. 해가 없으면 그 컵을
+        # 집지 않고 blacklist 처리 + /fallen_cup/unreachable 토픽으로 통보한다.
+        self.declare_parameter("preflight_reach_check", True)
 
         self.dry_run = bool(self.get_parameter("dry_run").value)
         self.use_current_as_home = bool(
@@ -544,6 +570,16 @@ class StandFallenCupNode(Node):
         self.multi_cup_min_samples_per_cluster = int(
             self.get_parameter("multi_cup_min_samples_per_cluster").value
         )
+        self.place_in_place = bool(self.get_parameter("place_in_place").value)
+        self.place_spot_avoid_radius_m = float(
+            self.get_parameter("place_spot_avoid_radius_m").value
+        )
+        self.upright_boxes_topic = str(
+            self.get_parameter("upright_boxes_topic").value
+        )
+        self.place_spot_candidates = self._parse_spot_candidates(
+            str(self.get_parameter("place_spot_candidates").value)
+        )
         self.cup_yaw_override_deg = float(
             self.get_parameter("cup_yaw_override_deg").value
         )
@@ -574,6 +610,18 @@ class StandFallenCupNode(Node):
         )
         self.pyramid_stack_wait_s = float(
             self.get_parameter("pyramid_stack_wait_s").value
+        )
+        self.avoid_upright_cups = bool(
+            self.get_parameter("avoid_upright_cups").value
+        )
+        self.upright_obstacle_radius_m = float(
+            self.get_parameter("upright_obstacle_radius_m").value
+        )
+        self.upright_obstacle_height_m = float(
+            self.get_parameter("upright_obstacle_height_m").value
+        )
+        self.preflight_reach_check = bool(
+            self.get_parameter("preflight_reach_check").value
         )
 
         log.info(f"=== POST-LIFT MODE: {self.mode} ===")
@@ -658,6 +706,13 @@ class StandFallenCupNode(Node):
         self._latest_cups_pose2d = None     # list of dict per cup_id (yaw, conf 등)
         self._cups_frame_samples = []       # list of frame dicts with cups list
 
+        # 정상(세워진) 컵 위치 스냅샷 (base_link XY). /hand_eye/boxes 최신 프레임.
+        # 빈 안전지점 선택 + 궤적 회피(실린더 collision object) 둘 다에 쓴다.
+        self._upright_cups = []             # list of (x, y)
+        if self.avoid_upright_cups:
+            self._upright_co_pub = self.create_publisher(
+                CollisionObject, "/collision_object", 10)
+
         # 활성 PLACE 좌표 (in-place stand 위해 multi-cup loop 가 override).
         # 기본값은 모듈 상수 — single-cup 동작 변경 없음. place_x/y 파라미터로 override 가능.
         _px = self.get_parameter("place_x").value
@@ -678,6 +733,10 @@ class StandFallenCupNode(Node):
         self.create_subscription(
             PoseArray, "/fallen_cup/cups_grasp_poses",
             self._cups_grasp_poses_cb, 10)
+        # 정상 컵 위치 (upright_cup_pose_node). 빈 안전지점 선택에 사용.
+        self.create_subscription(
+            MarkerArray, self.upright_boxes_topic,
+            self._upright_boxes_cb, 10)
 
         # ── 피라미드 장애물 상태 + API polling ────────────────────────────
         # center/degree 는 백그라운드 스레드가 API 를 polling 해 갱신(순수 데이터만
@@ -687,6 +746,8 @@ class StandFallenCupNode(Node):
         self._pyramid_occupied = set()      # 점유 슬롯 키 집합 (/stack 최신)
         self._pyramid_stack_seen = False    # /stack 메시지 수신 여부
         self._pyramid_obstacle_ids = []     # 등록된 collision object id (정리용)
+        self._upright_obstacle_ids = []     # 정상 컵 실린더 collision object id
+        self._upright_co_pub = None         # RViz 표준 scene 용 (아래서 생성)
         # move_group 의 표준 scene(/collision_object → /monitored_planning_scene)
         # 에도 박스를 publish 해서 RViz MotionPlanning 에 보이게 한다. (노드 자체
         # MoveItPy scene 은 moveit_py.yaml 의 별도 토픽이라 RViz 가 안 봄.)
@@ -719,6 +780,12 @@ class StandFallenCupNode(Node):
         if self.attach_gripper_collision:
             self._apply_scene_cli = self.create_client(
                 ApplyPlanningScene, "/apply_planning_scene")
+
+        # 도달불가(IK 해 없음) 컵 통보용 flag 토픽. pick 전 사전검증에서 approach/
+        # descend IK 해가 없으면 그 컵 정보를 JSON String 으로 발행한다(집지 않음).
+        self.unreachable_pub = self.create_publisher(
+            String, "/fallen_cup/unreachable", 10
+        )
 
         # sim 모드: 가상 컵 marker
         self.cup_marker_pub = None
@@ -944,6 +1011,70 @@ class StandFallenCupNode(Node):
 
         return (p_base, cup_yaw_base, len(samples), R_val)
 
+    @staticmethod
+    def _parse_spot_candidates(spec):
+        """'x:y,x:y' → [(x, y), ...]. 파싱 실패 항목은 무시."""
+        spots = []
+        for tok in spec.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                xs, ys = tok.split(":")
+                spots.append((float(xs), float(ys)))
+            except (ValueError, TypeError):
+                continue
+        return spots
+
+    def _upright_boxes_cb(self, msg):
+        """/hand_eye/boxes (base_link MarkerArray) → 정상 컵 XY 스냅샷 갱신.
+        매 발행이 DELETEALL + box_top/box_labels 전체 스냅샷이라 ns=='box_top'
+        ADD 마커만 모아 통째로 교체한다."""
+        cups = []
+        for m in msg.markers:
+            if m.action == Marker.ADD and m.ns == "box_top":
+                cups.append(
+                    (float(m.pose.position.x), float(m.pose.position.y)))
+        self._upright_cups = cups
+
+    def _select_safe_place_spot(self, blacklist):
+        """후보 PLACE 좌표 중 정상 컵/이미 세운 컵/피라미드를 모두 피한 첫 빈 자리.
+        없으면 None. 회피 반경 = place_spot_avoid_radius_m."""
+        log = self.get_logger()
+        r = self.place_spot_avoid_radius_m
+        uprights = list(self._upright_cups)
+        for (sx, sy) in self.place_spot_candidates:
+            hit_up = next(
+                ((ux, uy) for (ux, uy) in uprights
+                 if math.hypot(sx - ux, sy - uy) < r), None)
+            if hit_up is not None:
+                log.info(
+                    f"[spot] 후보 ({sx:.3f},{sy:.3f}) 스킵 — 정상 컵 "
+                    f"({hit_up[0]:.3f},{hit_up[1]:.3f}) 근접")
+                continue
+            hit_bl = next(
+                ((bx, by) for (bx, by) in blacklist
+                 if math.hypot(sx - bx, sy - by) < r), None)
+            if hit_bl is not None:
+                log.info(
+                    f"[spot] 후보 ({sx:.3f},{sy:.3f}) 스킵 — 기점유 "
+                    f"({hit_bl[0]:.3f},{hit_bl[1]:.3f}) 근접")
+                continue
+            if self._pyramid_center is not None:
+                pcx, pcy = self._pyramid_center
+                if math.hypot(sx - pcx, sy - pcy) < r:
+                    log.info(
+                        f"[spot] 후보 ({sx:.3f},{sy:.3f}) 스킵 — 피라미드 근접")
+                    continue
+            log.info(
+                f"[spot] 빈 안전지점 선택 → ({sx:.3f},{sy:.3f}) "
+                f"(정상 컵 {len(uprights)}개·기점유 {len(blacklist)}개 회피)")
+            return (sx, sy)
+        log.warn(
+            f"[spot] 빈 안전지점 없음 — 후보 {len(self.place_spot_candidates)}개 "
+            f"모두 점유/근접")
+        return None
+
     def _sense_multi_targets(self, blacklist):
         """SAMPLE_COLLECT_SEC 동안 cup frame sample 수집 → 클러스터링 → base 변환
         → blacklist 필터 → base 거리 가까운 순으로 정렬한 후보 리스트 반환.
@@ -1156,13 +1287,22 @@ class StandFallenCupNode(Node):
 
     # ── IK 잠금 헬퍼 ──────────────────────
     def ik_state_with_current_seed(self, pose_stamped, timeout=1.0,
-                                   seed_overrides=None):
+                                   seed_overrides=None, retries=12,
+                                   retry_timeout=0.2,
+                                   max_seed_jump=math.radians(90)):
         """
         현재 관절 상태를 seed로 IK를 풀어 RobotState를 만든다.
         목적: descend / lift에서 IK가 다른 branch를 골라 wrist가 회전하는 것 방지.
         seed_overrides (dict[str, float] | None): 주어지면 현재 joint dict에
           update해서 seed로 사용. 예: {"joint_1": 1.0472} → joint_1을 60°로 강제.
           IK solver(KDL)는 seed 근처로 수렴하므로 desired branch 유도 효과.
+
+        1차(원래 seed = current + overrides, full timeout) 실패 시 fallback:
+          KDL 수치 IK 는 seed 의존성이 커서 해가 존재해도 단일 seed 로는 수렴 못하는
+          경우가 흔하다(예: 베이스 안쪽 + 낮은 z 의 top-down 자세). 그래서 base_seed
+          주변을 점점 넓혀가며 랜덤 seed 로 재시도한다. base_seed 와의 최대 관절 편차가
+          max_seed_jump 이내인 해를 우선 채택(원래 branch 유지 → wrist-flip/큰 swing
+          방지). 그런 해가 끝내 없으면 편차가 가장 작은 해라도 반환(완전 실패보다 나음).
         반환: 성공 시 RobotState, 실패 시 None.
         """
         log = self.get_logger()
@@ -1170,32 +1310,64 @@ class StandFallenCupNode(Node):
         with psm.read_only() as scene:
             current_joints = dict(scene.current_state.joint_positions)
 
+        base_seed = dict(current_joints)
         if seed_overrides:
             for jn, jv in seed_overrides.items():
-                if jn in current_joints:
-                    current_joints[jn] = float(jv)
+                if jn in base_seed:
+                    base_seed[jn] = float(jv)
                 else:
                     log.warn(f"[ik-seed] unknown joint '{jn}' in overrides — 무시")
 
-        target_state = RobotState(self.robot_model)
-        target_state.joint_positions = current_joints  # seed = 현재 관절 (+ overrides)
-        target_state.update()
+        joint_names = list(base_seed.keys())
 
-        ok = target_state.set_from_ik(
-            GROUP_NAME,
-            pose_stamped.pose,
-            EE_LINK,
-            timeout,
-        )
-        if not ok:
-            log.error(
-                f"IK 실패: pose=({pose_stamped.pose.position.x:.3f},"
-                f"{pose_stamped.pose.position.y:.3f},"
-                f"{pose_stamped.pose.position.z:.3f})"
+        def _solve(seed, to):
+            st = RobotState(self.robot_model)
+            st.joint_positions = seed
+            st.update()
+            if not st.set_from_ik(GROUP_NAME, pose_stamped.pose, EE_LINK, to):
+                return None
+            st.update()
+            return st
+
+        # 1차: 원래 seed (current + overrides) — branch 유지 우선, full timeout.
+        st = _solve(base_seed, timeout)
+        if st is not None:
+            return st
+
+        # fallback: base_seed 주변 랜덤 seed 로 KDL 재수렴 유도.
+        best = None  # (jump, state) — max_seed_jump 초과지만 가장 가까운 해 보관.
+        for k in range(retries):
+            scale = 0.2 + 0.7 * (k / max(1, retries - 1))  # 0.2 → 0.9 rad 로 점증
+            seed = {jn: base_seed[jn] + float(np.random.uniform(-scale, scale))
+                    for jn in joint_names}
+            cand = _solve(seed, retry_timeout)
+            if cand is None:
+                continue
+            sol = cand.joint_positions
+            jump = max(abs(sol[jn] - base_seed[jn]) for jn in joint_names)
+            if jump <= max_seed_jump:
+                log.warn(
+                    f"[ik-retry] seed#{k + 1}/{retries} 수렴 (1차 current-seed 실패, "
+                    f"max Δjoint={math.degrees(jump):.0f}°)"
+                )
+                return cand
+            if best is None or jump < best[0]:
+                best = (jump, cand)
+
+        if best is not None:
+            log.warn(
+                f"[ik-retry] branch 유지 해 없음 → 최소 편차 해 채택 "
+                f"(max Δjoint={math.degrees(best[0]):.0f}°). wrist-flip/swing 주의."
             )
-            return None
-        target_state.update()
-        return target_state
+            return best[1]
+
+        log.error(
+            f"IK 실패: pose=({pose_stamped.pose.position.x:.3f},"
+            f"{pose_stamped.pose.position.y:.3f},"
+            f"{pose_stamped.pose.position.z:.3f}) "
+            f"(current-seed + 랜덤 seed {retries}회 모두 실패)"
+        )
+        return None
 
     # ── 수직 상승 헬퍼 ─────────────────────────────
     def _lift_straight_up(self, target_z):
@@ -1394,9 +1566,13 @@ class StandFallenCupNode(Node):
           6. _pick_and_handle_cup() 호출
           7. 성공 시 blacklist 에 PLACE 추가, 실패 시 skip
         루프 종료 후 final HOME 복귀.
+
+        반환: 실제로 세운 cup 이 하나라도 있으면 True, 0개면 False
+        (감지 0개 / 전부 도달불가 / 전부 pick 실패 → 실패로 통보).
         """
         log = self.get_logger()
         placed = []  # blacklist: list of (x, y) base frame — 이미 세운 cup 위치
+        stood = 0    # 실제로 세운 cup 수(도달불가/skip 제외) — 성공 판정용
 
         for it in range(self.multi_cup_max_iterations):
             log.info(
@@ -1416,6 +1592,9 @@ class StandFallenCupNode(Node):
             time.sleep(0.5)
 
             candidates = self._sense_multi_targets(placed)
+            # sense 동안 갱신된 정상 컵 스냅샷을 collision object 로 등록/갱신
+            # (이후 approach/lift/place 궤적이 정상 컵을 회피).
+            self._register_upright_obstacles()
             if not candidates:
                 log.info("[multi-cup] 처리할 cup 없음 → 루프 종료")
                 break
@@ -1430,13 +1609,42 @@ class StandFallenCupNode(Node):
                 f"dist={target['dist']:.3f}m (남은 후보 {len(candidates) - 1}개)"
             )
 
-            # in-place stand: PLACE = cup 원위치
-            self._active_place_x = float(p_base[0])
-            self._active_place_y = float(p_base[1])
-            log.info(
-                f"[multi-cup] PLACE = ({self._active_place_x:.3f}, "
-                f"{self._active_place_y:.3f}) (in-place stand)"
-            )
+            # 사전 도달성 검사: approach/descend IK 해가 없으면 집지 않고
+            # blacklist 처리 + /fallen_cup/unreachable 통보(다음 sense 에서도 제외).
+            if self.preflight_reach_check:
+                reachable, reason = self._preflight_grasp_reachable(p_base, cup_yaw)
+                if not reachable:
+                    log.warn(
+                        f"[preflight] cup ({p_base[0]:.3f},{p_base[1]:.3f}) "
+                        f"도달불가 — {reason}. pick 생략 + blacklist 추가, 통보."
+                    )
+                    self._publish_unreachable(p_base, cup_yaw, reason)
+                    placed.append((float(p_base[0]), float(p_base[1])))
+                    continue
+                log.info("[preflight] approach/descend IK OK → pick 진행")
+
+            if self.place_in_place:
+                # legacy: 제자리 세우기 — PLACE = cup 원위치
+                self._active_place_x = float(p_base[0])
+                self._active_place_y = float(p_base[1])
+                log.info(
+                    f"[multi-cup] PLACE = ({self._active_place_x:.3f}, "
+                    f"{self._active_place_y:.3f}) (in-place stand)"
+                )
+            else:
+                # 기본: 작업영역 빈 안전지점에 세우기 (정상 컵/기점유/피라미드 회피)
+                spot = self._select_safe_place_spot(placed)
+                if spot is None:
+                    log.warn(
+                        "[multi-cup] 빈 안전지점 없음 — 이 cup skip "
+                        "(pick 안 함, blacklist 추가 안 함)"
+                    )
+                    continue
+                self._active_place_x, self._active_place_y = spot
+                log.info(
+                    f"[multi-cup] PLACE = ({self._active_place_x:.3f}, "
+                    f"{self._active_place_y:.3f}) (safe-spot stand)"
+                )
 
             # cup_yaw override 가 set 되어 있으면 그대로 적용 (테스트 용도).
             # 정상 mode 에서는 NaN 이라 무시.
@@ -1449,17 +1657,64 @@ class StandFallenCupNode(Node):
                 continue
 
             placed.append((self._active_place_x, self._active_place_y))
+            stood += 1
             log.info(
-                f"[multi-cup] cup 처리 완료. blacklist 누적: {len(placed)}개"
+                f"[multi-cup] cup 처리 완료. 세운 cup {stood}개 "
+                f"(blacklist 누적 {len(placed)}개)"
             )
 
         log.info(
-            f"[multi-cup] 루프 종료. 총 처리: {len(placed)}개 / "
+            f"[multi-cup] 루프 종료. 세운 cup: {stood}개 / "
             f"max_iter={self.multi_cup_max_iterations}"
         )
         # final HOME 복귀 + 검증
         log.info("[Final] HOME 복귀 (시작 자세로)")
         self._return_to_session_home(final=True)
+        return stood > 0
+
+    def _preflight_grasp_reachable(self, p_base, cup_yaw):
+        """집기 전에 approach/descend IK 해가 있는지만 검사한다(실행·이동 없음).
+
+        descend 는 approach 해의 관절을 seed 로 풀어 실제 실행 시퀀스(approach 도달
+        후 그 자세에서 descend) 를 모사한다. ik_state_with_current_seed 의 랜덤 seed
+        fallback 까지 거치므로, '집어보면 IK 가 풀릴 컵' 을 도달불가로 오판하지 않는다.
+        반환: (ok: bool, reason: str).
+        """
+        bx, by, bz = float(p_base[0]), float(p_base[1]), float(p_base[2])
+        ori = self.grip_orientation(cup_yaw)
+        flange_at_grip = bz - CUP_R_AT_GRIP + TOOL_LENGTH_M
+        approach_z = flange_at_grip + APPROACH_OFFSET
+        descend_z = flange_at_grip + GRIP_Z_MARGIN
+        if descend_z < SAFE_Z_MIN:
+            descend_z = SAFE_Z_MIN
+
+        approach_state = self.ik_state_with_current_seed(
+            make_pose(bx, by, approach_z, ori)
+        )
+        if approach_state is None:
+            return False, f"approach IK 해 없음 @ z={approach_z:.3f}"
+
+        seed_from_approach = dict(approach_state.joint_positions)
+        descend_state = self.ik_state_with_current_seed(
+            make_pose(bx, by, descend_z, ori),
+            seed_overrides=seed_from_approach,
+        )
+        if descend_state is None:
+            return False, f"descend IK 해 없음 @ z={descend_z:.3f}"
+        return True, "ok"
+
+    def _publish_unreachable(self, p_base, cup_yaw, reason):
+        """도달불가 컵을 /fallen_cup/unreachable 토픽(JSON String)으로 통보."""
+        msg = String()
+        msg.data = json.dumps({
+            "x": round(float(p_base[0]), 4),
+            "y": round(float(p_base[1]), 4),
+            "z": round(float(p_base[2]), 4),
+            "cup_yaw_deg": round(math.degrees(cup_yaw), 1),
+            "reason": reason,
+            "stamp": self.get_clock().now().nanoseconds,
+        })
+        self.unreachable_pub.publish(msg)
 
     def _pick_and_handle_cup(self, p_base, cup_yaw):
         """단일 cup 의 cup_yaw override → approach → descend → close → lift →
@@ -2177,7 +2432,71 @@ class StandFallenCupNode(Node):
                 f"box=[{dims[0]:.3f},{dims[1]:.3f},{dims[2]:.3f}] "
                 f"yaw={math.degrees(yaw):.0f}°")
 
+    def _register_upright_obstacles(self):
+        """정상(세워진) 컵(self._upright_cups)을 MoveIt 실린더 collision object 로
+        등록/갱신. 메인 스레드에서 호출. 매번 이전 등록을 REMOVE 한 뒤 최신 스냅샷으로
+        다시 ADD 한다(컵이 사라지거나 옮겨져도 정합). 정상 컵 0개면 전부 REMOVE 만."""
+        if not self.avoid_upright_cups:
+            return
+        log = self.get_logger()
+        cups = list(self._upright_cups)
+        radius = self.upright_obstacle_radius_m
+        height = self.upright_obstacle_height_m
+        cz = TABLE_Z + height / 2.0
+
+        psm = self.robot.get_planning_scene_monitor()
+        with psm.read_write() as scene:
+            # 1) 이전 프레임 실린더 제거 (REMOVE) — 옮겨졌거나 사라진 컵 정리.
+            for old_id in self._upright_obstacle_ids:
+                rm = CollisionObject()
+                rm.header.frame_id = BASE_FRAME
+                rm.id = old_id
+                rm.operation = CollisionObject.REMOVE
+                scene.apply_collision_object(rm)
+                if self._upright_co_pub is not None:
+                    rm.header.stamp = self.get_clock().now().to_msg()
+                    self._upright_co_pub.publish(rm)
+            # 2) 최신 정상 컵마다 실린더 ADD.
+            registered = []
+            for i, (ux, uy) in enumerate(cups):
+                obj_id = f"upright_cup_{i}"
+                co = CollisionObject()
+                co.header.frame_id = BASE_FRAME
+                co.id = obj_id
+                prim = SolidPrimitive()
+                prim.type = SolidPrimitive.CYLINDER
+                # CYLINDER dims = [height, radius]
+                prim.dimensions = [height, radius]
+                pose = Pose()
+                pose.position.x = float(ux)
+                pose.position.y = float(uy)
+                pose.position.z = cz
+                pose.orientation.w = 1.0
+                co.primitives.append(prim)
+                co.primitive_poses.append(pose)
+                co.operation = CollisionObject.ADD
+                scene.apply_collision_object(co)
+                if self._upright_co_pub is not None:
+                    co.header.stamp = self.get_clock().now().to_msg()
+                    self._upright_co_pub.publish(co)
+                registered.append(obj_id)
+            scene.current_state.update()
+        self._upright_obstacle_ids = registered
+        if registered:
+            log.info(
+                f"[upright] 정상 컵 장애물 {len(registered)}개 등록 "
+                f"(r={radius*1000:.0f}mm, h={height*1000:.0f}mm): "
+                + ", ".join(f"({x:.3f},{y:.3f})" for x, y in cups))
+        else:
+            log.info("[upright] 정상 컵 0개 — 장애물 없음(이전 등록 정리)")
+
     def run(self):
+        """recovery 1회 실행. 성공 시 True, 실패 시 False 를 돌려준다.
+
+        main() 이 이 bool 을 프로세스 종료코드(0/1)로 변환하고, 그 코드가
+        cup_stack wrapper launch → 서버 LaunchManager 까지 그대로 전파돼
+        /api/robot/status 의 task 상태(idle=성공 / failed=실패)가 된다.
+        """
         log = self.get_logger()
 
         # controller action server 연결 대기
@@ -2210,7 +2529,7 @@ class StandFallenCupNode(Node):
                                         state_goal=home_state,
                                         params=self.ompl_params):
                     log.error("HOME 이동 실패 — 종료")
-                    return
+                    return False
             self._session_home_joints = dict(HOME_JOINTS)
 
         # 시작 시점의 link_6 pose를 저장 (종료 시 동일한 자세로 복귀했는지 검증용)
@@ -2234,8 +2553,7 @@ class StandFallenCupNode(Node):
         # multi-cup mode 분기: 별도 loop 가 sense + handle 을 반복.
         # loop 자체가 final HOME 복귀까지 수행하므로 여기서 return.
         if self.multi_cup and not self.sim:
-            self._run_multi_cup_loop()
-            return
+            return self._run_multi_cup_loop()
 
         if self.sim:
             # sim: 인식 우회, 파라미터로 받은 가상 컵 좌표 사용
@@ -2283,13 +2601,16 @@ class StandFallenCupNode(Node):
                 log.error("  1) 인식 노드가 use_depth:=true 인가?")
                 log.error("  2) ros2 topic hz /fallen_cup/grasp_pose 직접 확인")
                 log.error("  3) 컵이 카메라 화각 안, 거리 30~80cm, depth가 잡히는 표면인가?")
-                return
+                return False
 
             target = self.compute_target()
             if target is None:
                 log.error("target 계산 실패 — 종료")
-                return
+                return False
             p_base, cup_yaw = target
+
+        # sense 동안 갱신된 정상 컵을 collision object 로 등록 (궤적 회피).
+        self._register_upright_obstacles()
 
         # single-cup mode: 기본 PLACE 좌표(또는 place_x/y override) 사용
         _px = self.get_parameter("place_x").value
@@ -2297,7 +2618,7 @@ class StandFallenCupNode(Node):
         self._active_place_x = PLACE_X if math.isnan(_px) else float(_px)
         self._active_place_y = PLACE_Y if math.isnan(_py) else float(_py)
         if not self._pick_and_handle_cup(p_base, cup_yaw):
-            return
+            return False
 
         # 9) HOME 복귀 — 시작과 동일한 자세로 강제 복귀 (재시도 + 검증)
         log.info("[Final] HOME 복귀 (시작 자세로)")
@@ -2344,15 +2665,28 @@ class StandFallenCupNode(Node):
         if not home_ok:
             log.error("[Final] HOME 복귀 모든 시도 실패 — 로봇 자세 수동 확인 필요")
 
+        # 컵을 세웠으면 recovery 성공. HOME 복귀 실패는 경고만(컵은 이미 섰음).
+        return True
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = StandFallenCupNode()
+    ok = False
     try:
-        node.run()
+        ok = bool(node.run())
     finally:
         node.destroy_node()
         rclpy.shutdown()
+    # 종료코드로 성공/실패를 알린다(0=성공, 1=실패). cup_stack wrapper launch 가
+    # 이 코드를 전파하고 서버 LaunchManager 가 task 상태(idle/failed)로 반영한다.
+    # (rclpy 는 이미 shutdown 됐으므로 logger 대신 stderr 로 출력.)
+    if not ok:
+        print(
+            "[stand_fallen_cup] recovery 실패 — 종료코드 1 로 종료(서버에 failed 통보)",
+            file=sys.stderr,
+        )
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

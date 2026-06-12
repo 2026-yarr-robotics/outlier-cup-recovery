@@ -1,10 +1,28 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 from moveit_configs_utils import MoveItConfigsBuilder
+
+
+def _fail_launch_on_nonzero_exit(event, context):
+    """stand_fallen_cup 노드가 비정상 종료(코드!=0)하면 launch 자체를 실패시킨다.
+
+    ROS2 launch 는 자식 노드가 non-zero 로 죽어도 `ros2 launch` 종료코드를
+    0 으로 두기 때문에(LaunchService.run 은 launch 시스템 예외일 때만 1 반환),
+    여기서 예외를 던져 LaunchService 가 종료코드 1 을 반환하게 만든다. 이 코드가
+    cup_stack wrapper launch 를 거쳐 서버 LaunchManager 까지 전파돼야
+    /api/robot/status 의 fallen_cup_recovery task 가 failed 로 잡힌다.
+    """
+    if event.returncode != 0:
+        raise RuntimeError(
+            f"stand_fallen_cup 노드 비정상 종료(exit={event.returncode}) "
+            "— recovery 실패를 launch 종료코드로 전파"
+        )
+    return None
 
 
 def generate_launch_description():
@@ -55,6 +73,10 @@ def generate_launch_description():
     multi_cup_min_samples_per_cluster = LaunchConfiguration(
         "multi_cup_min_samples_per_cluster"
     )
+    place_in_place = LaunchConfiguration("place_in_place")
+    place_spot_candidates = LaunchConfiguration("place_spot_candidates")
+    place_spot_avoid_radius_m = LaunchConfiguration("place_spot_avoid_radius_m")
+    upright_boxes_topic = LaunchConfiguration("upright_boxes_topic")
     sim = LaunchConfiguration("sim")
     sim_cup_x = LaunchConfiguration("sim_cup_x")
     sim_cup_y = LaunchConfiguration("sim_cup_y")
@@ -68,6 +90,138 @@ def generate_launch_description():
     pyramid_sync_poll_period_s = LaunchConfiguration("pyramid_sync_poll_period_s")
     pyramid_obstacle_margin_m = LaunchConfiguration("pyramid_obstacle_margin_m")
     pyramid_stack_wait_s = LaunchConfiguration("pyramid_stack_wait_s")
+    avoid_upright_cups = LaunchConfiguration("avoid_upright_cups")
+    upright_obstacle_radius_m = LaunchConfiguration("upright_obstacle_radius_m")
+    upright_obstacle_height_m = LaunchConfiguration("upright_obstacle_height_m")
+    preflight_reach_check = LaunchConfiguration("preflight_reach_check")
+
+    stand_node = Node(
+        package="dsr_practice",
+        executable="stand_fallen_cup",
+        output="screen",
+        parameters=[
+            moveit_config.to_dict(),
+            moveit_py_params,
+            {
+                "dry_run": ParameterValue(dry_run, value_type=bool),
+                "cup_yaw_override_deg": ParameterValue(
+                    cup_yaw_override_deg, value_type=float
+                ),
+                "mode": ParameterValue(mode, value_type=str),
+                "place_flange_side": ParameterValue(
+                    place_flange_side, value_type=str
+                ),
+                "place_flange_yaw_deg": ParameterValue(
+                    place_flange_yaw_deg, value_type=float
+                ),
+                "place_flange_yaw_auto_extra_deg": ParameterValue(
+                    place_flange_yaw_auto_extra_deg, value_type=float
+                ),
+                "stand_cup_margin_m": ParameterValue(
+                    stand_cup_margin_m, value_type=float
+                ),
+                "place_base_yaw_deg": ParameterValue(
+                    place_base_yaw_deg, value_type=float
+                ),
+                "place_cup_tilt_deg": ParameterValue(
+                    place_cup_tilt_deg, value_type=float
+                ),
+                "place_plus_y_auto_swing": ParameterValue(
+                    place_plus_y_auto_swing, value_type=bool
+                ),
+                "place_plus_y_side": ParameterValue(
+                    place_plus_y_side, value_type=str
+                ),
+                "place_plus_y_base_yaw_deg": ParameterValue(
+                    place_plus_y_base_yaw_deg, value_type=float
+                ),
+                "place_plus_y_cup_tilt_deg": ParameterValue(
+                    place_plus_y_cup_tilt_deg, value_type=float
+                ),
+                "place_x": ParameterValue(
+                    place_x, value_type=float
+                ),
+                "place_y": ParameterValue(
+                    place_y, value_type=float
+                ),
+                "multi_cup": ParameterValue(
+                    multi_cup, value_type=bool
+                ),
+                "multi_cup_max_iterations": ParameterValue(
+                    multi_cup_max_iterations, value_type=int
+                ),
+                "multi_cup_cluster_radius_m": ParameterValue(
+                    multi_cup_cluster_radius_m, value_type=float
+                ),
+                "multi_cup_blacklist_radius_m": ParameterValue(
+                    multi_cup_blacklist_radius_m, value_type=float
+                ),
+                "multi_cup_min_samples_per_cluster": ParameterValue(
+                    multi_cup_min_samples_per_cluster, value_type=int
+                ),
+                "place_in_place": ParameterValue(
+                    place_in_place, value_type=bool
+                ),
+                "place_spot_candidates": ParameterValue(
+                    place_spot_candidates, value_type=str
+                ),
+                "place_spot_avoid_radius_m": ParameterValue(
+                    place_spot_avoid_radius_m, value_type=float
+                ),
+                "upright_boxes_topic": ParameterValue(
+                    upright_boxes_topic, value_type=str
+                ),
+                "sim": ParameterValue(sim, value_type=bool),
+                "sim_cup_x": ParameterValue(sim_cup_x, value_type=float),
+                "sim_cup_y": ParameterValue(sim_cup_y, value_type=float),
+                "sim_cup_z": ParameterValue(sim_cup_z, value_type=float),
+                "sim_cup_yaw_deg": ParameterValue(
+                    sim_cup_yaw_deg, value_type=float
+                ),
+                "robot_namespace": ParameterValue(
+                    robot_namespace, value_type=str
+                ),
+                # moveit_py.yaml의 절대경로 joint_state_topic을 override.
+                # parameters 리스트에서 yaml(moveit_py_params)보다 뒤에
+                # 오므로 우선 적용된다. 네임스페이스 bringup에서
+                # planning_scene_monitor가 /<ns>/joint_states 를 구독해야
+                # 현재 관절을 읽어 plan/IK 가 된다.
+                "planning_scene_monitor_options.joint_state_topic": (
+                    ParameterValue(joint_state_topic, value_type=str)
+                ),
+                "pyramid_avoid": ParameterValue(
+                    pyramid_avoid, value_type=bool
+                ),
+                "pyramid_config_url": ParameterValue(
+                    pyramid_config_url, value_type=str
+                ),
+                "pyramid_stack_topic": ParameterValue(
+                    pyramid_stack_topic, value_type=str
+                ),
+                "pyramid_sync_poll_period_s": ParameterValue(
+                    pyramid_sync_poll_period_s, value_type=float
+                ),
+                "pyramid_obstacle_margin_m": ParameterValue(
+                    pyramid_obstacle_margin_m, value_type=float
+                ),
+                "pyramid_stack_wait_s": ParameterValue(
+                    pyramid_stack_wait_s, value_type=float
+                ),
+                "avoid_upright_cups": ParameterValue(
+                    avoid_upright_cups, value_type=bool
+                ),
+                "upright_obstacle_radius_m": ParameterValue(
+                    upright_obstacle_radius_m, value_type=float
+                ),
+                "upright_obstacle_height_m": ParameterValue(
+                    upright_obstacle_height_m, value_type=float
+                ),
+                "preflight_reach_check": ParameterValue(
+                    preflight_reach_check, value_type=bool
+                ),
+            },
+        ],
+    )
 
     return LaunchDescription(
         [
@@ -201,6 +355,29 @@ def generate_launch_description():
                 description="cluster 최소 sample 수. 이 미만이면 noise 로 무시.",
             ),
             DeclareLaunchArgument(
+                "place_in_place",
+                default_value="false",
+                description="multi_cup 에서 cup 을 제자리에 세움(legacy). false(기본)면 "
+                            "작업영역 빈 안전지점에 세움.",
+            ),
+            DeclareLaunchArgument(
+                "place_spot_candidates",
+                default_value="0.30:0.10,0.30:0.00,0.30:-0.10",
+                description="빈 안전지점 후보 'x:y,x:y,...' (base_link, 1순위부터). "
+                            "기본 = 검증값 (0.30,0.10) + 좌우 2개.",
+            ),
+            DeclareLaunchArgument(
+                "place_spot_avoid_radius_m",
+                default_value="0.09",
+                description="후보를 '점유'로 볼 회피 반경(m) — 정상 컵/기점유/피라미드 공통.",
+            ),
+            DeclareLaunchArgument(
+                "upright_boxes_topic",
+                default_value="/hand_eye/boxes",
+                description="정상(세워진) 컵 위치 토픽 (upright_cup_pose_node 발행, "
+                            "base_link MarkerArray).",
+            ),
+            DeclareLaunchArgument(
                 "sim",
                 default_value="false",
                 description="True면 카메라/그리퍼 HW 우회 (MoveIt virtual용)",
@@ -279,108 +456,38 @@ def generate_launch_description():
                 description="등록 시 /stack 첫 수신을 기다리는 시간(s). sticky 라 "
                             "vision 이 떠 있으면 즉시 도착. 미수신이면 장애물 스킵.",
             ),
-            Node(
-                package="dsr_practice",
-                executable="stand_fallen_cup",
-                output="screen",
-                parameters=[
-                    moveit_config.to_dict(),
-                    moveit_py_params,
-                    {
-                        "dry_run": ParameterValue(dry_run, value_type=bool),
-                        "cup_yaw_override_deg": ParameterValue(
-                            cup_yaw_override_deg, value_type=float
-                        ),
-                        "mode": ParameterValue(mode, value_type=str),
-                        "place_flange_side": ParameterValue(
-                            place_flange_side, value_type=str
-                        ),
-                        "place_flange_yaw_deg": ParameterValue(
-                            place_flange_yaw_deg, value_type=float
-                        ),
-                        "place_flange_yaw_auto_extra_deg": ParameterValue(
-                            place_flange_yaw_auto_extra_deg, value_type=float
-                        ),
-                        "stand_cup_margin_m": ParameterValue(
-                            stand_cup_margin_m, value_type=float
-                        ),
-                        "place_base_yaw_deg": ParameterValue(
-                            place_base_yaw_deg, value_type=float
-                        ),
-                        "place_cup_tilt_deg": ParameterValue(
-                            place_cup_tilt_deg, value_type=float
-                        ),
-                        "place_plus_y_auto_swing": ParameterValue(
-                            place_plus_y_auto_swing, value_type=bool
-                        ),
-                        "place_plus_y_side": ParameterValue(
-                            place_plus_y_side, value_type=str
-                        ),
-                        "place_plus_y_base_yaw_deg": ParameterValue(
-                            place_plus_y_base_yaw_deg, value_type=float
-                        ),
-                        "place_plus_y_cup_tilt_deg": ParameterValue(
-                            place_plus_y_cup_tilt_deg, value_type=float
-                        ),
-                        "place_x": ParameterValue(
-                            place_x, value_type=float
-                        ),
-                        "place_y": ParameterValue(
-                            place_y, value_type=float
-                        ),
-                        "multi_cup": ParameterValue(
-                            multi_cup, value_type=bool
-                        ),
-                        "multi_cup_max_iterations": ParameterValue(
-                            multi_cup_max_iterations, value_type=int
-                        ),
-                        "multi_cup_cluster_radius_m": ParameterValue(
-                            multi_cup_cluster_radius_m, value_type=float
-                        ),
-                        "multi_cup_blacklist_radius_m": ParameterValue(
-                            multi_cup_blacklist_radius_m, value_type=float
-                        ),
-                        "multi_cup_min_samples_per_cluster": ParameterValue(
-                            multi_cup_min_samples_per_cluster, value_type=int
-                        ),
-                        "sim": ParameterValue(sim, value_type=bool),
-                        "sim_cup_x": ParameterValue(sim_cup_x, value_type=float),
-                        "sim_cup_y": ParameterValue(sim_cup_y, value_type=float),
-                        "sim_cup_z": ParameterValue(sim_cup_z, value_type=float),
-                        "sim_cup_yaw_deg": ParameterValue(
-                            sim_cup_yaw_deg, value_type=float
-                        ),
-                        "robot_namespace": ParameterValue(
-                            robot_namespace, value_type=str
-                        ),
-                        # moveit_py.yaml의 절대경로 joint_state_topic을 override.
-                        # parameters 리스트에서 yaml(moveit_py_params)보다 뒤에
-                        # 오므로 우선 적용된다. 네임스페이스 bringup에서
-                        # planning_scene_monitor가 /<ns>/joint_states 를 구독해야
-                        # 현재 관절을 읽어 plan/IK 가 된다.
-                        "planning_scene_monitor_options.joint_state_topic": (
-                            ParameterValue(joint_state_topic, value_type=str)
-                        ),
-                        "pyramid_avoid": ParameterValue(
-                            pyramid_avoid, value_type=bool
-                        ),
-                        "pyramid_config_url": ParameterValue(
-                            pyramid_config_url, value_type=str
-                        ),
-                        "pyramid_stack_topic": ParameterValue(
-                            pyramid_stack_topic, value_type=str
-                        ),
-                        "pyramid_sync_poll_period_s": ParameterValue(
-                            pyramid_sync_poll_period_s, value_type=float
-                        ),
-                        "pyramid_obstacle_margin_m": ParameterValue(
-                            pyramid_obstacle_margin_m, value_type=float
-                        ),
-                        "pyramid_stack_wait_s": ParameterValue(
-                            pyramid_stack_wait_s, value_type=float
-                        ),
-                    },
-                ],
-            )
+            DeclareLaunchArgument(
+                "avoid_upright_cups",
+                default_value="true",
+                description="정상(세워진) 컵(/hand_eye/boxes)을 실린더 collision "
+                            "object 로 등록해 궤적이 회피. 매 sense 직후 갱신.",
+            ),
+            DeclareLaunchArgument(
+                "upright_obstacle_radius_m",
+                default_value="0.04",
+                description="정상 컵 장애물 실린더 반경(m). 컵 반경+여유. 기본 4cm.",
+            ),
+            DeclareLaunchArgument(
+                "upright_obstacle_height_m",
+                default_value="0.12",
+                description="정상 컵 장애물 실린더 높이(m). 컵 높이+여유, 테이블에서 "
+                            "위로. 기본 12cm.",
+            ),
+            DeclareLaunchArgument(
+                "preflight_reach_check",
+                default_value="true",
+                description="pick 전에 approach/descend IK 해를 미리 검사. 해가 없으면 "
+                            "그 컵을 집지 않고 blacklist 처리 + /fallen_cup/unreachable "
+                            "토픽으로 통보.",
+            ),
+            stand_node,
+            # 노드가 non-zero 로 죽으면 launch 종료코드도 non-zero 가 되게 함
+            # (서버 LaunchManager 가 task 를 failed 로 표시하도록).
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=stand_node,
+                    on_exit=_fail_launch_on_nonzero_exit,
+                )
+            ),
         ]
     )
