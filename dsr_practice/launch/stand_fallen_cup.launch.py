@@ -78,6 +78,7 @@ def generate_launch_description():
     place_spot_avoid_radius_m = LaunchConfiguration("place_spot_avoid_radius_m")
     upright_boxes_topic = LaunchConfiguration("upright_boxes_topic")
     sim = LaunchConfiguration("sim")
+    gripper_backend = LaunchConfiguration("gripper_backend")
     sim_cup_x = LaunchConfiguration("sim_cup_x")
     sim_cup_y = LaunchConfiguration("sim_cup_y")
     sim_cup_z = LaunchConfiguration("sim_cup_z")
@@ -172,6 +173,9 @@ def generate_launch_description():
                     upright_boxes_topic, value_type=str
                 ),
                 "sim": ParameterValue(sim, value_type=bool),
+                "gripper_backend": ParameterValue(
+                    gripper_backend, value_type=str
+                ),
                 "sim_cup_x": ParameterValue(sim_cup_x, value_type=float),
                 "sim_cup_y": ParameterValue(sim_cup_y, value_type=float),
                 "sim_cup_z": ParameterValue(sim_cup_z, value_type=float),
@@ -381,6 +385,13 @@ def generate_launch_description():
                 "sim",
                 default_value="false",
                 description="True면 카메라/그리퍼 HW 우회 (MoveIt virtual용)",
+            ),
+            DeclareLaunchArgument(
+                "gripper_backend",
+                default_value="",
+                description="그리퍼 경로: ''(레거시: sim?none:onrobot) | "
+                            "'onrobot'(Modbus) | 'topic'(/gripper/target_width, "
+                            "Isaac SimRG) | 'none'",
             ),
             DeclareLaunchArgument(
                 "sim_cup_x",

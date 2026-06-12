@@ -49,6 +49,28 @@ from moveit.planning import MoveItPy, PlanRequestParameters
 from .onrobot import RG
 
 
+class TopicRG:
+    """SimRG(토픽) 그리퍼 백엔드 — Isaac 디지털 트윈 경로.
+
+    OnRobot Modbus 대신 cup_stack gripper_node(SimRG)와 동일한 토픽 계약을
+    쓴다: /gripper/target_width 에 목표 폭(mm)을 발행하면 Isaac 의
+    gripper_bridge 가 손가락을 애니메이션하고 sticky attach/release 를
+    수행한다. move_gripper 의 width 단위는 OnRobot 계약(1/10 mm)을 그대로
+    받아 mm 로 변환한다 (GRIP_OPEN_WIDTH=700 → 70.0 mm).
+    """
+
+    def __init__(self, node, topic: str = "/gripper/target_width") -> None:
+        from std_msgs.msg import Float32
+        self._pub = node.create_publisher(Float32, topic, 10)
+        self._log = node.get_logger()
+
+    def move_gripper(self, width_val, force_val=400):  # noqa: ARG002 — force는 sim에서 무의미
+        from std_msgs.msg import Float32
+        width_mm = float(width_val) / 10.0
+        self._pub.publish(Float32(data=width_mm))
+        self._log.info(f"[topic-gripper] target_width {width_mm:.1f} mm")
+
+
 # ─────────────────────────────────────────────────────────
 #  설정 (click_pick_two.py와 동일한 환경 가정)
 # ─────────────────────────────────────────────────────────
@@ -461,6 +483,13 @@ class StandFallenCupNode(Node):
         self.declare_parameter("upright_boxes_topic", "/hand_eye/boxes")
         # sim: 카메라/그리퍼 하드웨어 없이 MoveIt virtual에서 동작 시각화
         self.declare_parameter("sim", False)
+        # gripper_backend: 그리퍼 경로를 sim 플래그와 분리 (Isaac 디지털
+        # 트윈은 인식은 실제(카메라 발행)·그리퍼는 토픽이어야 한다):
+        #   ''(기본)  — 레거시: sim ? none : onrobot
+        #   'onrobot' — RG Modbus 직접 (실기)
+        #   'topic'   — /gripper/target_width 발행 (Isaac SimRG 계약)
+        #   'none'    — 그리퍼 명령 전부 no-op
+        self.declare_parameter("gripper_backend", "")
         self.declare_parameter("sim_cup_x", 0.28)   # 넘어진-컵 작업영역(피라미드 정면 0.45,0 에서 옆·뒤로 빠짐)
         self.declare_parameter("sim_cup_y", 0.20)
         self.declare_parameter("sim_cup_z", 0.10)
@@ -645,11 +674,20 @@ class StandFallenCupNode(Node):
         self.gripper2cam[:3, 3] /= 1000.0  # mm → m
         log.info(f"Hand-Eye 로드: {calib_file}")
 
-        # 그리퍼 (sim 모드면 HW를 아예 잡지 않는다 — RG()는 lazy connect라
-        # 생성자에서 안 터지므로, sim이면 구성 자체를 건너뛰어 _gripper_move가
-        # no-op이 되게 한다.)
-        if self.sim:
-            log.warn("[sim] gripper HW 우회 — 그리퍼 명령은 모두 skip 된다")
+        # 그리퍼 백엔드 선택 (sim 플래그와 직교 — Isaac 은 sim=false +
+        # gripper_backend=topic 으로 인식은 실제, 그리퍼는 토픽 경로를 쓴다).
+        # ''(기본) = 레거시 동작 유지: sim ? none : onrobot.
+        # RG()는 lazy connect라 생성자에서 안 터지지만, none 이면 구성 자체를
+        # 건너뛰어 _gripper_move 가 no-op 이 되게 한다.
+        backend = str(self.get_parameter("gripper_backend").value).strip()
+        if not backend:
+            backend = "none" if self.sim else "onrobot"
+        if backend == "topic":
+            log.warn("[gripper] TOPIC 백엔드 — /gripper/target_width 발행 "
+                     "(Isaac SimRG 계약)")
+            self.gripper = TopicRG(self)
+        elif backend == "none":
+            log.warn("[gripper] 백엔드 none — 그리퍼 명령은 모두 skip 된다")
             self.gripper = None
         else:
             self.gripper = RG(GRIPPER_NAME, TOOLCHARGER_IP, TOOLCHARGER_PORT)
