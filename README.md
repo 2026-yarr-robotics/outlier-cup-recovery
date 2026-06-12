@@ -100,6 +100,41 @@ ros2 launch dsr_practice stand_fallen_cup.launch.py \
 > 피라미드 회피는 `/stack` 점유 슬롯 + `pyramid_config_url` 응답이 모두 있을 때만 실제로
 > 동작하며, 없으면 graceful no-op 입니다. ([피라미드 영역 회피](#피라미드-영역-회피-place-모드))
 
+## 실행 파이프라인
+
+`stand_fallen_cup` 노드 1회 실행은 다음 순서로 진행됩니다.
+
+```
+초기화
+  ├─ controller 연결 대기 → HOME 이동 (Pilz PTP, 실패 시 OMPL)
+  ├─ 그리퍼 부피를 link_6 에 attach (이후 모든 plan 이 그리퍼 충돌 회피)
+  ├─ 피라미드 점유 슬롯을 collision object 로 등록 (pyramid_avoid)
+  └─ 그리퍼 open
+
+컵 처리  (single = 1회 / multi_cup = cup 마다 반복)
+  ├─ Sense     : /fallen_cup/* 샘플 수집 → 클러스터링 → 가장 가까운 cup 선정
+  ├─ 정상 컵을 collision object 로 등록 (avoid_upright_cups)
+  ├─ Preflight : approach/descend IK 사전 검사 — 해 없으면 skip + /fallen_cup/unreachable
+  ├─ PLACE 결정 : single = PLACE_X/Y(또는 override) · multi = 빈 안전지점 선택(또는 제자리)
+  └─ Pick & handle
+       [1] Approach   컵 위로 이동 (Pilz)
+       [2] Descend    IK current-seed 잠금(+랜덤 seed fallback)으로 수직 하강
+       [3] Close      그리퍼를 닫아 컵 머리 옆을 잡음
+       [4] Lift       수직 상승 (LIFT_Z)
+       └─ mode=place : ±Y auto-swing 판단 → base swing → twist 분리 → 기울여 세움 → release → retreat
+          mode=drop  : 들어 올린 채 대기 후 release
+
+마무리
+  ├─ HOME 복귀 (OMPL, 실패 시 Pilz PTP) + 시작/종료 자세 비교 검증
+  └─ 종료코드로 성공/실패 전파 (0 = 성공, 1 = 실패 → 통합 task 상태)
+```
+
+- **`multi_cup`**: 매 iteration 마다 HOME 으로 복귀해 카메라 시야를 확보한 뒤 재sense →
+  다음 cup 처리. 더 이상 후보가 없거나 `multi_cup_max_iterations` 에 도달하면 종료합니다.
+- **단계별 세부**: 실패 전파·사전 도달성 검사는
+  [실패 보고 & 사전 도달성 검사](#실패-보고--사전-도달성-검사),
+  ±Y auto-swing·피라미드 회피는 [피라미드 영역 회피](#피라미드-영역-회피-place-모드) 참고.
+
 ## 피라미드 영역 회피 (place 모드)
 
 `place` 모드로 세운 컵을 작업공간에 내려놓을 때, 옆에 **이미 쌓여 있는 컵 피라미드**를
