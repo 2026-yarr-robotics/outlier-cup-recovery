@@ -125,6 +125,34 @@ ros2 launch dsr_practice stand_fallen_cup.launch.py \
   - +Y 미감지(다른 컵)면 no-op 이라 항상 켜 둬도 안전. 한 명령으로 ±Y 양쪽 케이스 처리.
 - `place_x` / `place_y` — PLACE 좌표를 리빌드 없이 override(base_link, m). `nan`(기본)이면 모듈 상수 사용.
 
+## 실패 보고 & 사전 도달성 검사
+
+### 종료코드로 실패 전파 (통합)
+
+`stand_fallen_cup` 은 recovery 결과를 **프로세스 종료코드**로 알립니다 — 성공 `0`, 실패 `1`.
+통합(`cup-stack-integration`)은 recovery 를 1회성 launch 태스크로 실행하고 서버가 그
+종료코드를 태스크 상태(`idle`=성공 / `failed`=실패)로 반영하므로, 컵을 세우지 못하면
+상위 파이프라인이 실패를 인지할 수 있습니다.
+
+- **노드**: HOME 이동 / 인식 / IK / 집기 중 하나라도 실패하면 종료코드 `1`.
+  `multi_cup` 모드는 **실제로 세운 컵이 0개**일 때만 실패로 봅니다. (마지막 HOME 복귀
+  실패는 컵이 이미 섰으므로 성공으로 간주하고 경고만 남깁니다.)
+- **launch**: ROS 2 launch 는 자식 노드가 비정상 종료해도 `ros2 launch` 종료코드를 `0`
+  으로 두기 때문에, `stand_fallen_cup.launch.py` 가 노드 종료코드를 감지해 non-zero 면
+  launch 자체를 실패시켜 종료코드를 그대로 전파합니다.
+
+### 사전 도달성 검사 (`preflight_reach_check`, 기본 ON)
+
+컵을 집기 **전에** approach/descend 자세의 IK 해를 미리 풀어봐서, 해가 없을 컵은
+**집지 않고 건너뜁니다**. 건너뛴 컵은 blacklist 에 추가(다음 sense 에서도 제외)하고
+`/fallen_cup/unreachable` (`std_msgs/String`, JSON `{x, y, z, cup_yaw_deg, reason, stamp}`)
+로 통보합니다.
+
+- 베이스 안쪽 경계처럼 KDL 단일-seed IK 가 해가 있어도 수렴하지 못하는 경우를 위해,
+  IK 는 1차 실패 시 base seed 주변 랜덤 seed 로 재시도하는 fallback 을 거칩니다
+  (wrist-flip 방지를 위해 base seed 대비 관절 편차가 작은 해를 우선 채택).
+- 사전 검사도 이 fallback 을 거치므로 '집어보면 풀렸을 컵' 을 도달불가로 오판하지 않습니다.
+
 ## 주요 파라미터
 
 `stand_fallen_cup`
@@ -138,6 +166,8 @@ ros2 launch dsr_practice stand_fallen_cup.launch.py \
 - `pyramid_stack_topic` — 피라미드 슬롯 점유 토픽(기본 `/stack`)
 - `place_plus_y_auto_swing` — `true`(기본)면 ±Y 누운 케이스 자동 감지 후 base swing
 - `place_x` / `place_y` — PLACE 좌표 override (base_link, m; `nan`이면 모듈 상수)
+- `preflight_reach_check` — `true`(기본)면 집기 전 approach/descend IK 를 미리 검사,
+  해가 없으면 그 컵을 skip + `/fallen_cup/unreachable` 통보
 
 `fallen_cup_pose_node`
 - `target_class_name` — 기본 `fallen-cup`. 빈 문자열이면 클래스 필터링 끔
