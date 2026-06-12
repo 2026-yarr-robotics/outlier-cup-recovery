@@ -24,6 +24,7 @@ YOLO 인식 노드(fallen_cup_pose_node)가 publish하는
 
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -837,9 +838,21 @@ class StandFallenCupNode(Node):
             self.create_timer(0.3, self._publish_cup_marker)
 
     def _publish_cup_marker(self):
-        """sim 모드에서 컵 시각화. 상태(initial/attached/placed)에 따라 자세 갱신."""
+        """sim 모드에서 컵 시각화. 상태(initial/attached/placed)에 따라 자세 갱신.
+
+        try/except: 0.3s 타이머가 노드 teardown 과 경합하면 죽은 컨텍스트에
+        publish 를 시도해 RCLError → terminate(SIGABRT) 로 task 가 '성공 후
+        failed' 로 보고됐다 (Isaac 검증에서 실측). 실기는 sim=false 라 타이머
+        자체가 없어 미발현.
+        """
         if not self.sim or self.cup_marker_pub is None:
             return
+        try:
+            self._publish_cup_marker_inner()
+        except Exception:  # noqa: BLE001 — teardown 경합은 무시
+            pass
+
+    def _publish_cup_marker_inner(self):
         if self._cup_state == "removed":
             # delete marker
             m = Marker()
@@ -2713,18 +2726,24 @@ def main(args=None):
     ok = False
     try:
         ok = bool(node.run())
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    except Exception as exc:  # noqa: BLE001 — 결과 코드로 전파
+        print(f"[stand_fallen_cup] 예외: {exc}", file=sys.stderr)
     # 종료코드로 성공/실패를 알린다(0=성공, 1=실패). cup_stack wrapper launch 가
     # 이 코드를 전파하고 서버 LaunchManager 가 task 상태(idle/failed)로 반영한다.
-    # (rclpy 는 이미 shutdown 됐으므로 logger 대신 stderr 로 출력.)
     if not ok:
         print(
             "[stand_fallen_cup] recovery 실패 — 종료코드 1 로 종료(서버에 failed 통보)",
             file=sys.stderr,
         )
-    sys.exit(0 if ok else 1)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # HARD EXIT (os._exit): destroy_node/rclpy.shutdown 경유의 정상 종료는
+    # MoveItPy C++ teardown 과 경합해 작업 '성공 후' 프로세스가 SIGABRT 로
+    # 죽는다 (Isaac 검증 실측: rmw publish RCLError, malloc_consolidate 힙
+    # 오염 — 모두 [Final] 완료 이후). 소멸자를 건너뛰어 작업 결과가 종료코드로
+    # 정확히 전파되게 한다. 커널이 모든 리소스를 회수하므로 one-shot 태스크에
+    # 안전하다.
+    os._exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
