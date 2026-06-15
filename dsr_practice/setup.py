@@ -28,6 +28,8 @@ setup(
     entry_points={
         'console_scripts': [
             'stand_fallen_cup = dsr_practice.stand_fallen_cup:main',
+            'place_mouth_up_cup = dsr_practice.place_mouth_up_cup:main',
+            'outlier_cup_recovery = dsr_practice.outlier_cup_recovery:main',
         ],
     },
 )

@@ -47,34 +47,31 @@ from moveit.core.robot_state import RobotState
 from moveit.planning import MoveItPy, PlanRequestParameters
 
 from .onrobot import RG
+from .common import (
+    GROUP_NAME,
+    BASE_FRAME,
+    EE_LINK,
+    HOME_JOINTS,
+    SAFE_X_MIN,
+    SAFE_Y_MIN,
+    SAFE_Y_MAX,
+    SAFE_Z_MIN,
+    R_DOWN,
+    clamp_to_safe_workspace,
+    plan_and_execute,
+    make_pose,
+    get_ee_matrix,
+    rotmat_to_quat_xyzw,
+    circular_mean,
+    circular_R,
+    angular_diff,
+)
 
 
 # ─────────────────────────────────────────────────────────
 #  설정 (click_pick_two.py와 동일한 환경 가정)
+#  GROUP_NAME/BASE_FRAME/EE_LINK/HOME_JOINTS/SAFE_* 는 common.py 로 이동(공용).
 # ─────────────────────────────────────────────────────────
-GROUP_NAME = "manipulator"
-BASE_FRAME = "base_link"
-EE_LINK    = "link_6"
-
-# 고정 원점(HOME) 자세. 2026-06-09 사용자가 실로봇으로 직접 만든 자세를
-# /joint_states 에서 캡처한 라디안 원값. (참고 도: j1 -2.84, j2 -14.92,
-# j3 88.48, j4 -2.96, j5 107.60, j6 86.61). fallen-cup / mouth-up-cup 두
-# task 모두 이 값을 공유(place_mouth_up_cup 가 import).
-HOME_JOINTS = {
-    "joint_1": -0.049552422016859055,
-    "joint_2": -0.26035377383232117,
-    "joint_3": 1.5442062616348267,
-    "joint_4": -0.05165897682309151,
-    "joint_5": 1.8779057264328003,
-    "joint_6": 1.5116537809371948,
-}
-
-# 안전 작업 영역 (m, base_link 기준) — click_pick_two와 동일
-SAFE_X_MIN = 0.0
-SAFE_Y_MIN = -0.30
-SAFE_Y_MAX =  0.30
-SAFE_Z_MIN =  0.05   # link_6 flange 기준 최저 안전 z
-                     # (TOOL_LENGTH_M 보정 후 손가락 기준이 아닌 flange 기준)
 
 # z 보정 — bz(=depth가 읽은 컵 표면)에서 flange 목표 z로 변환
 #   flange_at_grip = bz - CUP_R_AT_GRIP + TOOL_LENGTH_M
@@ -217,144 +214,28 @@ BASE_OFFSET_Z = 0.080 # Z 오차는 joint_6 무관하게 +8cm 일정 (그리퍼 
 # ─────────────────────────────────────────────────────────
 #  유틸
 # ─────────────────────────────────────────────────────────
-def clamp_to_safe_workspace(x, y, z, logger):
-    if x < SAFE_X_MIN:
-        logger.warning(f"x={x:.3f} clamped to {SAFE_X_MIN}")
-        x = SAFE_X_MIN
-    if y < SAFE_Y_MIN:
-        logger.warning(f"y={y:.3f} clamped to {SAFE_Y_MIN}")
-        y = SAFE_Y_MIN
-    elif y > SAFE_Y_MAX:
-        logger.warning(f"y={y:.3f} clamped to {SAFE_Y_MAX}")
-        y = SAFE_Y_MAX
-    if z < SAFE_Z_MIN:
-        logger.warning(f"z={z:.3f} clamped to {SAFE_Z_MIN}")
-        z = SAFE_Z_MIN
-    return x, y, z
-
-
-def plan_and_execute(robot, arm, logger, pose_goal=None,
-                     state_goal=None, params=None, clamp=True):
-    arm.set_start_state_to_current_state()
-
-    if pose_goal is not None:
-        if clamp:
-            x = pose_goal.pose.position.x
-            y = pose_goal.pose.position.y
-            z = pose_goal.pose.position.z
-            sx, sy, sz = clamp_to_safe_workspace(x, y, z, logger)
-            pose_goal.pose.position.x = sx
-            pose_goal.pose.position.y = sy
-            pose_goal.pose.position.z = sz
-        arm.set_goal_state(pose_stamped_msg=pose_goal, pose_link=EE_LINK)
-    elif state_goal is not None:
-        arm.set_goal_state(robot_state=state_goal)
-    else:
-        logger.error("pose/state 없음")
-        return False
-
-    plan_result = (arm.plan(parameters=params)
-                   if params is not None else arm.plan())
-    if not plan_result:
-        logger.error("Planning 실패")
-        return False
-
-    robot.execute(group_name=GROUP_NAME,
-                  robot_trajectory=plan_result.trajectory,
-                  blocking=True)
-    return True
-
-
-def make_pose(x, y, z, ori):
-    p = PoseStamped()
-    p.header.frame_id = BASE_FRAME
-    p.pose.position.x = float(x)
-    p.pose.position.y = float(y)
-    p.pose.position.z = float(z)
-    p.pose.orientation.x = ori["x"]
-    p.pose.orientation.y = ori["y"]
-    p.pose.orientation.z = ori["z"]
-    p.pose.orientation.w = ori["w"]
-    return p
-
-
-def get_ee_matrix(moveit_robot):
-    psm = moveit_robot.get_planning_scene_monitor()
-    with psm.read_only() as scene:
-        T = scene.current_state.get_global_link_transform(EE_LINK)
-    return np.asarray(T, dtype=float)
-
-
-def rotmat_to_quat_xyzw(R):
-    """3x3 회전행렬 → quaternion (x, y, z, w). scipy 대체."""
-    tr = R[0, 0] + R[1, 1] + R[2, 2]
-    if tr > 0.0:
-        s = math.sqrt(tr + 1.0) * 2.0
-        w = 0.25 * s
-        x = (R[2, 1] - R[1, 2]) / s
-        y = (R[0, 2] - R[2, 0]) / s
-        z = (R[1, 0] - R[0, 1]) / s
-    elif (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
-        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-        w = (R[2, 1] - R[1, 2]) / s
-        x = 0.25 * s
-        y = (R[0, 1] + R[1, 0]) / s
-        z = (R[0, 2] + R[2, 0]) / s
-    elif R[1, 1] > R[2, 2]:
-        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-        w = (R[0, 2] - R[2, 0]) / s
-        x = (R[0, 1] + R[1, 0]) / s
-        y = 0.25 * s
-        z = (R[1, 2] + R[2, 1]) / s
-    else:
-        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-        w = (R[1, 0] - R[0, 1]) / s
-        x = (R[0, 2] + R[2, 0]) / s
-        y = (R[1, 2] + R[2, 1]) / s
-        z = 0.25 * s
-    return float(x), float(y), float(z), float(w)
-
-
-# DOWN_ORI 쿼터니언 (0,1,0,0) = Y축 180° 회전 → 회전행렬로 미리 캐시
-R_DOWN = np.array([
-    [-1.0, 0.0,  0.0],
-    [ 0.0, 1.0,  0.0],
-    [ 0.0, 0.0, -1.0],
-])
-
-
-# ─────────────────────────────────────────────────────────
-#  Circular statistics (yaw 안정화용)
-# ─────────────────────────────────────────────────────────
-def circular_mean(angles):
-    c = sum(math.cos(a) for a in angles) / len(angles)
-    s = sum(math.sin(a) for a in angles) / len(angles)
-    return math.atan2(s, c)
-
-
-def circular_R(angles):
-    # |mean vector|. 1.0 = 완전 일치, 0.0 = 완전 분산
-    c = sum(math.cos(a) for a in angles) / len(angles)
-    s = sum(math.sin(a) for a in angles) / len(angles)
-    return math.hypot(c, s)
-
-
-def angular_diff(a, b):
-    d = a - b
-    while d > math.pi:
-        d -= 2.0 * math.pi
-    while d < -math.pi:
-        d += 2.0 * math.pi
-    return d
+# clamp_to_safe_workspace / plan_and_execute / make_pose / get_ee_matrix /
+# rotmat_to_quat_xyzw / R_DOWN / circular_mean / circular_R / angular_diff 는
+# common.py 로 이동(공용). 위 import 참조.
 
 
 # ─────────────────────────────────────────────────────────
 #  Node
 # ─────────────────────────────────────────────────────────
 class StandFallenCupNode(Node):
-    def __init__(self):
+    def __init__(self, moveit_py=None, gripper=None):
         super().__init__("stand_fallen_cup")
         log = self.get_logger()
+
+        # outlier_cup_recovery 통합 실행 시 오케스트레이터가 비싼 자원
+        # (MoveItPy, RG 그리퍼)을 1개만 만들어 주입한다. standalone 실행이면
+        # 둘 다 None → 아래에서 평소처럼 자체 생성(=기존 동작 그대로).
+        self._injected_moveit_py = moveit_py
+        self._injected_gripper = gripper
+
+        # 통합 오케스트레이터가 읽는 결과 카운터/플래그 (multi_cup 루프에서 갱신).
+        self.recovered_count = 0
+        self.saw_candidate = False
 
         # ROS parameters (dry-run / yaw override 용)
         self.declare_parameter("dry_run", False)
@@ -648,7 +529,10 @@ class StandFallenCupNode(Node):
         # 그리퍼 (sim 모드면 HW를 아예 잡지 않는다 — RG()는 lazy connect라
         # 생성자에서 안 터지므로, sim이면 구성 자체를 건너뛰어 _gripper_move가
         # no-op이 되게 한다.)
-        if self.sim:
+        if self._injected_gripper is not None:
+            log.info("주입된 그리퍼 재사용 (outlier_cup_recovery)")
+            self.gripper = self._injected_gripper
+        elif self.sim:
             log.warn("[sim] gripper HW 우회 — 그리퍼 명령은 모두 skip 된다")
             self.gripper = None
         else:
@@ -662,12 +546,16 @@ class StandFallenCupNode(Node):
         # <ns>/dsr_moveit_controller 에, joint_states 구독이 <ns>/joint_states 에 바인딩.
         log.info("MoveItPy 초기화 중…")
         ns = self.robot_namespace
-        moveit_kwargs = {"node_name": "stand_fallen_cup_moveit_py"}
-        if ns and ns != "/":
-            moveit_kwargs["name_space"] = ns
-            moveit_kwargs["remappings"] = {"__ns": ns}
-            log.info(f"MoveItPy namespace: {ns}")
-        self.robot = MoveItPy(**moveit_kwargs)
+        if self._injected_moveit_py is not None:
+            log.info("주입된 MoveItPy 재사용 (outlier_cup_recovery)")
+            self.robot = self._injected_moveit_py
+        else:
+            moveit_kwargs = {"node_name": "stand_fallen_cup_moveit_py"}
+            if ns and ns != "/":
+                moveit_kwargs["name_space"] = ns
+                moveit_kwargs["remappings"] = {"__ns": ns}
+                log.info(f"MoveItPy namespace: {ns}")
+            self.robot = MoveItPy(**moveit_kwargs)
         self.arm = self.robot.get_planning_component(GROUP_NAME)
         self.robot_model = self.robot.get_robot_model()
         log.info("MoveItPy 초기화 완료")
@@ -1599,6 +1487,10 @@ class StandFallenCupNode(Node):
                 log.info("[multi-cup] 처리할 cup 없음 → 루프 종료")
                 break
 
+            # 통합 오케스트레이터에게 "fallen 후보가 실제로 있었다" 알림
+            # (도달불가/skip 으로 0개 세워도 detected>0 이면 실패로 통보됨).
+            self.saw_candidate = True
+
             target = candidates[0]  # 가장 가까운 cup
             p_base = target["p_base"]
             cup_yaw = target["cup_yaw"]
@@ -1667,6 +1559,7 @@ class StandFallenCupNode(Node):
             f"[multi-cup] 루프 종료. 세운 cup: {stood}개 / "
             f"max_iter={self.multi_cup_max_iterations}"
         )
+        self.recovered_count = stood
         # final HOME 복귀 + 검증
         log.info("[Final] HOME 복귀 (시작 자세로)")
         self._return_to_session_home(final=True)
