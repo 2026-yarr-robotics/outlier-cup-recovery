@@ -146,8 +146,8 @@ class FallenCupPoseNode(Node):
         # speed-stack recovery 용으로 컵의 narrow 끝 부근을 잡아 들어 올린 뒤
         # 회전시켜 wide 면을 바닥으로 향하게 세움. 가까운 끝(narrow)을 잡아야
         # 회전 시 그리퍼/로봇이 바닥에 안 부딪히고 안정적으로 매달림.
-        # 기본 0.015 m = 1.5 cm. 컵이 더 길거나 narrow 끝 직경이 크면 키워야.
-        self.declare_parameter("grip_offset_m", 0.015)
+        # 기본 0.025 m = 2.5 cm. 컵이 더 길거나 narrow 끝 직경이 크면 키워야.
+        self.declare_parameter("grip_offset_m", 0.025)
 
         # depth를 안 쓸 때 pixel offset 계산용.
         # 실제 컵의 작은 원 지름을 재서 넣는 것을 추천.

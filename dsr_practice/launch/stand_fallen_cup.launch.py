@@ -281,11 +281,11 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "place_cup_tilt_deg",
-                default_value="0.0",
+                default_value="8.0",
                 description="place 모드: cup을 vertical에서 -EE_Z 방향으로 α° 기울여서 "
                             "release. flange Z가 sin α × TOOL_LENGTH 만큼 상승 → "
                             "elbow 자연 회피. α=20°에서 약 +68mm. "
-                            "기본 0 (수직). 권장 10~20°. 30°+ 면 cup 넘어질 위험.",
+                            "기본 8 (15°에서 일부 컵이 넘어져 낮춤). 30°+ 면 cup 넘어질 위험.",
             ),
             DeclareLaunchArgument(
                 "place_plus_y_auto_swing",
@@ -310,9 +310,9 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "place_plus_y_cup_tilt_deg",
-                default_value="25.0",
+                default_value="8.0",
                 description="auto_swing 발동 시 사용할 place_cup_tilt_deg (deg). "
-                            "기본 25 (사용자 검증값).",
+                            "기본 8 (25°에서 일부 컵이 넘어져 낮춤).",
             ),
             DeclareLaunchArgument(
                 "place_x",

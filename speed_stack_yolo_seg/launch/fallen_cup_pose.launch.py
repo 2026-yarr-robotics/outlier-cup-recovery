@@ -72,10 +72,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "grip_offset_m",
-            default_value="0.015",
+            default_value="0.025",
             description="grip point offset from top center toward bottom (m). "
-                        "Default 0.015 grips near the narrow tip so the cup can be "
-                        "tilted upright without the wide end colliding with the table.",
+                        "Default 0.025 grips ~2.5cm in from the narrow tip so the cup "
+                        "can be tilted upright without the wide end colliding with the table.",
         ),
         DeclareLaunchArgument(
             "top_diameter_m",
